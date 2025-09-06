@@ -1,1 +1,1 @@
-web: gunicorn recharge_bot:app --preload --workers 1 --threads 8 --timeout 120
+web: gunicorn -k gthread -w 1 -b 0.0.0.0:$PORT recharge_bot:app
