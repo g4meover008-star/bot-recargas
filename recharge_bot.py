@@ -1,71 +1,45 @@
 import os, io, uuid, asyncio, logging, qrcode
 from datetime import datetime
-
 from flask import Flask, request, jsonify
 from mercadopago import SDK
 
-# ====== Telegram con aiogram (no usa httpx) ======
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from supabase import create_client, Client
 
-# ====== Supabase con httpx >= 0.27 ======
-from httpx import Client as HttpxClient
-from supabase import create_client, Client, ClientOptions
-
-# =============== LOG =================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("recargas")
 
-# =============== ENV =================
-TG_BOT_TOKEN = os.getenv("TG_RECHARGE_BOT_TOKEN", "")     # token del BOT DE RECARGAS
+# ========= ENV =========
+TG_BOT_TOKEN = os.getenv("TG_RECHARGE_BOT_TOKEN", "")   # token del BOT DE RECARGAS (no el principal)
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_API_KEY") or ""
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")        # ej: https://web-production-xxxx.up.railway.app
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # ej: https://web-production-xxxx.up.railway.app
 CURRENCY = os.getenv("CURRENCY", "PEN")
-PRICE_PER_CREDIT = float(os.getenv("PRICE_PER_CREDIT", "1"))  # 1 sol = 1 crédito por defecto
+PRICE_PER_CREDIT = float(os.getenv("PRICE_PER_CREDIT", "1"))
 
 if not (TG_BOT_TOKEN and SUPABASE_URL and SUPABASE_KEY and MP_ACCESS_TOKEN and PUBLIC_BASE_URL):
-    raise SystemExit(
-        "Faltan variables: TG_RECHARGE_BOT_TOKEN, SUPABASE_URL, SUPABASE_ANON_KEY/API_KEY, "
-        "MP_ACCESS_TOKEN, PUBLIC_BASE_URL"
-    )
+    raise SystemExit("Faltan variables de entorno: TG_RECHARGE_BOT_TOKEN, SUPABASE_URL, SUPABASE_ANON_KEY/SUPABASE_API_KEY, MP_ACCESS_TOKEN, PUBLIC_BASE_URL")
 
-# =============== CLIENTES ================
-# Supabase con httpx (>=0.27) para evitar el error de 'proxy'
-http_client = HttpxClient(timeout=30.0)
-supabase: Client = create_client(
-    SUPABASE_URL,
-    SUPABASE_KEY,
-    options=ClientOptions(http_client=http_client)
-)
-
+# ========= CLIENTES =========
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 mp = SDK(MP_ACCESS_TOKEN)
+app_flask = Flask(__name__)
+tg_app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
 
-# Telegram (aiogram)
-bot = Bot(TG_BOT_TOKEN, parse_mode="HTML")
-dp = Dispatcher()
-rt = Router()
-dp.include_router(rt)
-
-# Flask (webhook Mercado Pago)
-app = Flask(__name__)
-
-# =============== DB HELPERS ===============
+# ========= DB helpers =========
 def pagos_upsert(pago_id: str, user_id: str, username: str, amount: float, pref_id: str, init_point: str):
-    supabase.table("pagos").upsert(
-        {
-            "id": pago_id,
-            "user_id": str(user_id),
-            "username": username,
-            "amount": amount,
-            "status": "pendiente",
-            "preference_id": pref_id,
-            "init_point": init_point,
-            "created_at": datetime.utcnow().isoformat()
-        },
-        on_conflict="id"
-    ).execute()
+    supabase.table("pagos").upsert({
+        "id": pago_id,
+        "user_id": str(user_id),
+        "username": username,
+        "amount": amount,
+        "status": "pendiente",
+        "preference_id": pref_id,
+        "init_point": init_point,
+        "created_at": datetime.utcnow().isoformat()
+    }, on_conflict="id").execute()
 
 def pagos_set_status(pago_id: str, new_status: str, payment_id: str | None = None):
     data = {"status": new_status, "updated_at": datetime.utcnow().isoformat()}
@@ -83,7 +57,6 @@ def user_add_credits(user_id: str, amount_paid: float):
     to_add = int(round(amount_paid / PRICE_PER_CREDIT))
     new_value = current + to_add
     supabase.table("usuarios").update({"creditos": new_value}).eq("telegram_id", str(user_id)).execute()
-    # historial (opcional)
     try:
         supabase.table("creditos_historial").insert({
             "usuario_id": str(user_id),
@@ -95,7 +68,7 @@ def user_add_credits(user_id: str, amount_paid: float):
         pass
     return to_add, new_value
 
-# =============== MP HELPERS ===============
+# ========= MP helpers =========
 def mp_create_preference(pago_id: str, amount: float):
     pref = {
         "items": [{
@@ -113,98 +86,83 @@ def mp_create_preference(pago_id: str, amount: float):
 def mp_get_payment(payment_id: str):
     return mp.payment().get(payment_id)
 
-# =============== QR ===============
+# ========= QR =========
 def build_qr_png_bytes(url: str) -> bytes:
     img = qrcode.make(url)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-# =============== TELEGRAM HANDLERS (aiogram) ===============
-@rt.message(F.text.regexp(r"^/start"))
-async def cmd_start(msg: Message):
-    await msg.answer(
+# ========= TELEGRAM =========
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
         "🤖 Bot de Recargas\n"
-        "Usa <code>/recargar &lt;monto&gt;</code>\n\n"
+        "Usa /recargar <monto>\n\n"
         "Ejemplos:\n"
         "/recargar 5  (5 soles)\n"
         "/recargar 10 (10 soles)\n\n"
-        "Recibirás un link de pago (y QR opcional). Cuando se apruebe, "
-        "acreditaré automáticamente tus créditos."
+        "Te daré un link de pago (y QR). Cuando MP apruebe, acreditaré créditos."
     )
 
-@rt.message(F.text.regexp(r"^/recargar(\s+.+)?"))
-async def cmd_recargar(msg: Message):
-    parts = (msg.text or "").strip().split()
-    if len(parts) != 2:
-        await msg.reply("Uso: /recargar <monto_en_soles>\nEj: /recargar 5")
+async def cmd_recargar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if len(context.args) != 1:
+        await update.message.reply_text("Uso: /recargar <monto_en_soles>\nEj: /recargar 5")
         return
-
     try:
-        amount = float(parts[1])
+        amount = float(context.args[0])
         if amount <= 0:
             raise ValueError()
     except Exception:
-        await msg.reply("Monto inválido. Ej: /recargar 5")
+        await update.message.reply_text("Monto inválido. Ej: /recargar 5")
         return
 
     pago_id = str(uuid.uuid4())
     pref_id, init_point = mp_create_preference(pago_id, amount)
-    pagos_upsert(pago_id, str(msg.from_user.id), msg.from_user.username or "", amount, pref_id, init_point)
+    pagos_upsert(pago_id, str(user.id), user.username or "", amount, pref_id, init_point)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Pagar ahora", url=init_point)],
-        [InlineKeyboardButton(text="🧾 Ver QR", callback_data=f"qr:{pago_id}")]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Pagar ahora", url=init_point)],
+        [InlineKeyboardButton("🧾 Ver QR", callback_data=f"qr:{pago_id}")]
     ])
-    await msg.reply(
-        f"🔗 Tu link de pago por {amount:.2f} {CURRENCY} está listo.\n"
-        f"ID de pedido: <code>{pago_id}</code>\n\n"
-        "Cuando el pago se apruebe, acreditaré los créditos automáticamente. "
+    await update.message.reply_text(
+        f"🔗 Link de pago por {amount:.2f} {CURRENCY}\n"
+        f"Pedido: <code>{pago_id}</code>\n\n"
         "Si prefieres QR, pulsa “Ver QR”.",
         reply_markup=kb
     )
 
-@rt.callback_query(F.data.startswith("qr:"))
-async def on_qr_callback(q: CallbackQuery):
-    pago_id = q.data.split(":", 1)[1]
+async def on_qr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    if not data.startswith("qr:"):
+        return
+    pago_id = data.split(":", 1)[1]
     row = pagos_get(pago_id)
     if not row:
-        await q.message.answer("No encuentro ese pedido.")
-        await q.answer()
+        await q.message.reply_text("No encuentro ese pedido.")
         return
-
-    init_point = row.get("init_point")
+    init_point = row.get("init_point") or ""
     if not init_point:
-        await q.message.answer("No tengo el link de pago aún.")
-        await q.answer()
+        await q.message.reply_text("No tengo el link de pago aún.")
         return
-
     png = build_qr_png_bytes(init_point)
-    await q.message.answer_photo(BufferedInputFile(png, filename="qr.png"), caption="Escanea para pagar.")
-    await q.answer()
+    await q.message.reply_photo(png, caption="Escanea para pagar (es el mismo link).")
 
-async def notify_user(user_id: int, amount_paid: float, added: int, new_total: int):
-    try:
-        text = (
-            "✅ <b>Recarga acreditada</b>\n"
-            f"Pago: {amount_paid:.2f} {CURRENCY}\n"
-            f"Créditos añadidos: <b>{added}</b>\n"
-            f"Saldo actual: <b>{new_total}</b>"
-        )
-        await bot.send_message(user_id, text)
-    except Exception:
-        log.warning("No pude notificar al usuario.")
+tg_app.add_handler(CommandHandler("start", cmd_start))
+tg_app.add_handler(CommandHandler("recargar", cmd_recargar))
+tg_app.add_handler(CallbackQueryHandler(on_qr_callback, pattern=r"^qr:"))
 
-# =============== FLASK (WEB) ===============
-@app.get("/health")
+# ========= FLASK WEBHOOK =========
+app_flask = Flask(__name__)
+
+@app_flask.get("/health")
 def health():
     return "ok", 200
 
-@app.post("/mp/webhook")
+@app_flask.post("/mp/webhook")
 def mp_webhook():
-    """
-    Mercado Pago envía: { "type":"payment", "data":{"id":"<payment_id>"} }
-    """
     try:
         body = request.get_json(force=True, silent=True) or {}
         log.info(f"Webhook MP: {body}")
@@ -236,34 +194,41 @@ def mp_webhook():
 
         if status == "approved":
             pagos_set_status(ext_ref, "aprobado", payment_id)
-            user_id = int(pedido["user_id"])
-            added, new_total = user_add_credits(str(user_id), amount)
-
+            user_id = pedido["user_id"]
+            added, new_total = user_add_credits(user_id, amount)
             asyncio.get_event_loop().create_task(
-                notify_user(user_id, amount, added, new_total)
+                notify_user(int(user_id), amount, added, new_total)
             )
             return jsonify({"status": "ok"}), 200
-
         elif status in ("rejected", "cancelled", "refunded", "charged_back"):
             pagos_set_status(ext_ref, status, payment_id)
             return jsonify({"status": status}), 200
         else:
-            pagos_set_status(ext_ref, status, payment_id)   # pending / in_process / etc.
+            pagos_set_status(ext_ref, status, payment_id)
             return jsonify({"status": status}), 200
-
     except Exception as e:
         log.exception("Error en webhook")
         return jsonify({"error": str(e)}), 500
 
-# =============== MAIN ===============
+async def notify_user(user_id: int, amount_paid: float, added: int, new_total: int):
+    try:
+        text = (
+            "✅ <b>Recarga acreditada</b>\n"
+            f"Pago: {amount_paid:.2f} {CURRENCY}\n"
+            f"Créditos añadidos: <b>{added}</b>\n"
+            f"Saldo actual: <b>{new_total}</b>"
+        )
+        await tg_app.bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
+    except Exception:
+        log.warning("No pude notificar al usuario.")
+
+# ========= MAIN =========
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
 
     async def run_all():
-        # Telegram polling en segundo plano
-        asyncio.create_task(dp.start_polling(bot))
-        # Servidor HTTP para Railway
+        asyncio.create_task(tg_app.run_polling(close_loop=False))
         from waitress import serve
-        serve(app, host="0.0.0.0", port=port)
+        serve(app_flask, host="0.0.0.0", port=port)
 
     asyncio.run(run_all())
