@@ -1,1 +1,1 @@
-web: gunicorn -k gthread -w 1 -b 0.0.0.0:$PORT "recharge_bot:create_app()"
+web: gunicorn recharge_bot:app_flask --threads 2 --timeout 0
