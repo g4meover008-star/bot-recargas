@@ -1,1 +1,1 @@
-web: gunicorn -w 1 -k gthread -t 120 recharge_bot:app
+web: gunicorn recharge_bot:app --workers 1 --threads 4 --timeout 120

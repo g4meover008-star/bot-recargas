@@ -1,12 +1,15 @@
-Flask==3.0.0
+# Web API para recargas
+flask==3.0.3
 gunicorn==21.2.0
-requests==2.31.0
 
-mercadopago==2.2.3
+# Mercado Pago SDK (Python)
+mercadopago==2.2.0
 
+# Supabase (solo cliente REST y auth sync)
 supabase==2.3.4
-# NO fijes realtime (lo trae supabase)
-qrcode==7.4.2
-Pillow==10.4.0
 
-httpx==0.27.2
+# Compatibilidad que exige supabase
+httpx==0.26.1
+
+# Utilidades
+python-dotenv==1.0.1
