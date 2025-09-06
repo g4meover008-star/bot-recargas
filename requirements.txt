@@ -2,19 +2,13 @@ Flask==3.0.0
 gunicorn==21.2.0
 requests==2.31.0
 
-# Mercado Pago SDK
 mercadopago==2.2.3
 
-# Supabase
 supabase==2.3.4
-realtime==2.0.2
+# realtime  ->  NO fijar (lo instala supabase con versión <2.0.0)
 
-# Para generar QR si lo usas
 qrcode==7.4.2
 Pillow==10.4.0
 
-# Telegram (solo si usas el envío por Bot API simple, no polling)
 python-telegram-bot==20.7
-
-# Compatibilidad python-telegram-bot 20.x
 httpx==0.25.2
