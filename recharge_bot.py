@@ -247,3 +247,46 @@ if __name__ == "__main__":
     # 2) Flask para Railway (escucha HTTP)
     log.info(f"Sirviendo Flask en 0.0.0.0:{port}")
     serve(app_flask, host="0.0.0.0", port=port)
+
+# ========= START TELEGRAM EN SEGUNDO PLANO (para Gunicorn) =========
+import threading
+
+_TG_STARTED = False
+
+def _start_telegram_polling_background():
+    """Arranca el bot de Telegram en un hilo con su propio event loop."""
+    global _TG_STARTED
+    if _TG_STARTED:
+        return
+    _TG_STARTED = True
+
+    def _runner():
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            log.info("Iniciando polling de Telegram…")
+            tg_app.run_polling(close_loop=True)
+        except Exception:
+            log.exception("Fallo al iniciar el polling de Telegram")
+
+    threading.Thread(target=_runner, name="tg-polling", daemon=True).start()
+
+
+def create_app():
+    """
+    Factory para Gunicorn: al ser llamada por Gunicorn, lanzamos el
+    polling de Telegram en background y devolvemos el Flask app.
+    """
+    _start_telegram_polling_background()
+    return app_flask
+
+# ========= MAIN para ejecución local (python recharge_bot.py) =========
+if __name__ == "__main__":
+    from waitress import serve
+    port = int(os.getenv("PORT", "8080"))
+
+    # En local también iniciamos el bot.
+    _start_telegram_polling_background()
+
+    log.info(f"Sirviendo Flask en 0.0.0.0:{port}")
+    serve(app_flask, host="0.0.0.0", port=port)
