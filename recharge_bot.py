@@ -1,34 +1,54 @@
-import os, io, uuid, asyncio, logging, qrcode
+import os
+import io
+import uuid
+import asyncio
+import logging
+import threading
 from datetime import datetime
+
+import qrcode
 from flask import Flask, request, jsonify
 from mercadopago import SDK
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 from supabase import create_client, Client
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+)
+
+# -------------------- LOGGING --------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 log = logging.getLogger("recargas")
 
-# ========= ENV =========
-TG_BOT_TOKEN = os.getenv("TG_RECHARGE_BOT_TOKEN", "")   # token del BOT DE RECARGAS (no el principal)
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_API_KEY") or ""
+# -------------------- ENV -----------------------
+TG_BOT_TOKEN   = os.getenv("TG_RECHARGE_BOT_TOKEN", "")
+SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY   = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_API_KEY") or ""
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # ej: https://web-production-xxxx.up.railway.app
-CURRENCY = os.getenv("CURRENCY", "PEN")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")       # ej: https://web-production-xxxx.up.railway.app
+CURRENCY        = os.getenv("CURRENCY", "PEN")
 PRICE_PER_CREDIT = float(os.getenv("PRICE_PER_CREDIT", "1"))
 
-if not (TG_BOT_TOKEN and SUPABASE_URL and SUPABASE_KEY and MP_ACCESS_TOKEN and PUBLIC_BASE_URL):
-    raise SystemExit("Faltan variables de entorno: TG_RECHARGE_BOT_TOKEN, SUPABASE_URL, SUPABASE_ANON_KEY/SUPABASE_API_KEY, MP_ACCESS_TOKEN, PUBLIC_BASE_URL")
+REQUIRED_VARS = [TG_BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY, MP_ACCESS_TOKEN, PUBLIC_BASE_URL]
+if not all(REQUIRED_VARS):
+    raise SystemExit(
+        "Faltan variables de entorno: TG_RECHARGE_BOT_TOKEN, SUPABASE_URL, "
+        "SUPABASE_ANON_KEY/SUPABASE_API_KEY, MP_ACCESS_TOKEN, PUBLIC_BASE_URL"
+    )
 
-# ========= CLIENTES =========
+# -------------------- CLIENTES -------------------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 mp = SDK(MP_ACCESS_TOKEN)
 app_flask = Flask(__name__)
+
+# Telegram Application
 tg_app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
 
-# ========= DB helpers =========
+
+# -------------------- DB HELPERS -----------------
 def pagos_upsert(pago_id: str, user_id: str, username: str, amount: float, pref_id: str, init_point: str):
     supabase.table("pagos").upsert({
         "id": pago_id,
@@ -57,6 +77,7 @@ def user_add_credits(user_id: str, amount_paid: float):
     to_add = int(round(amount_paid / PRICE_PER_CREDIT))
     new_value = current + to_add
     supabase.table("usuarios").update({"creditos": new_value}).eq("telegram_id", str(user_id)).execute()
+    # opcional historial
     try:
         supabase.table("creditos_historial").insert({
             "usuario_id": str(user_id),
@@ -68,17 +89,18 @@ def user_add_credits(user_id: str, amount_paid: float):
         pass
     return to_add, new_value
 
-# ========= MP helpers =========
+
+# -------------------- MP HELPERS -----------------
 def mp_create_preference(pago_id: str, amount: float):
     pref = {
         "items": [{
             "title": "Recarga de créditos",
             "quantity": 1,
             "currency_id": CURRENCY,
-            "unit_price": float(amount)
+            "unit_price": float(amount),
         }],
         "external_reference": pago_id,
-        "notification_url": f"{PUBLIC_BASE_URL}/mp/webhook"
+        "notification_url": f"{PUBLIC_BASE_URL}/mp/webhook",
     }
     resp = mp.preference().create(pref)
     return resp["response"]["id"], resp["response"]["init_point"]
@@ -86,14 +108,19 @@ def mp_create_preference(pago_id: str, amount: float):
 def mp_get_payment(payment_id: str):
     return mp.payment().get(payment_id)
 
-# ========= QR =========
+
+# -------------------- UTILS ----------------------
 def build_qr_png_bytes(url: str) -> bytes:
     img = qrcode.make(url)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-# ========= TELEGRAM =========
+
+# -------------------- TELEGRAM HANDLERS ----------
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong ✅")
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Bot de Recargas\n"
@@ -123,7 +150,7 @@ async def cmd_recargar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("💳 Pagar ahora", url=init_point)],
-        [InlineKeyboardButton("🧾 Ver QR", callback_data=f"qr:{pago_id}")]
+        [InlineKeyboardButton("🧾 Ver QR", callback_data=f"qr:{pago_id}")],
     ])
     await update.message.reply_text(
         f"🔗 Link de pago por {amount:.2f} {CURRENCY}\n"
@@ -150,13 +177,18 @@ async def on_qr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     png = build_qr_png_bytes(init_point)
     await q.message.reply_photo(png, caption="Escanea para pagar (es el mismo link).")
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Error en handler", exc_info=context.error)
+
+# registra handlers
+tg_app.add_handler(CommandHandler("ping", cmd_ping))
 tg_app.add_handler(CommandHandler("start", cmd_start))
 tg_app.add_handler(CommandHandler("recargar", cmd_recargar))
 tg_app.add_handler(CallbackQueryHandler(on_qr_callback, pattern=r"^qr:"))
+tg_app.add_error_handler(on_error)
 
-# ========= FLASK WEBHOOK =========
-app_flask = Flask(__name__)
 
+# -------------------- FLASK ----------------------
 @app_flask.get("/health")
 def health():
     return "ok", 200
@@ -200,15 +232,19 @@ def mp_webhook():
                 notify_user(int(user_id), amount, added, new_total)
             )
             return jsonify({"status": "ok"}), 200
+
         elif status in ("rejected", "cancelled", "refunded", "charged_back"):
             pagos_set_status(ext_ref, status, payment_id)
             return jsonify({"status": status}), 200
+
         else:
             pagos_set_status(ext_ref, status, payment_id)
             return jsonify({"status": status}), 200
+
     except Exception as e:
         log.exception("Error en webhook")
         return jsonify({"error": str(e)}), 500
+
 
 async def notify_user(user_id: int, amount_paid: float, added: int, new_total: int):
     try:
@@ -222,28 +258,37 @@ async def notify_user(user_id: int, amount_paid: float, added: int, new_total: i
     except Exception:
         log.warning("No pude notificar al usuario.")
 
-# ========= MAIN =========
-if __name__ == "__main__":
-    import threading
-    from waitress import serve
 
-    port = int(os.getenv("PORT", "8080"))
+# -------------------- SERVIDORES -----------------
+def _start_telegram_polling():
+    """Arranca PTB en un hilo con su propio event loop."""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        log.info("Iniciando polling de Telegram…")
+        tg_app.run_polling(drop_pending_updates=True, close_loop=True)
+    except Exception:
+        log.exception("Fallo al iniciar el polling de Telegram")
 
-    def _start_telegram_polling():
-        """Arranca el bot en un hilo con su propio event loop."""
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            log.info("Iniciando polling de Telegram…")
-            # PTB v20 crea y usa este loop; al cerrarlo libera recursos.
-            tg_app.run_polling(close_loop=True)
-        except Exception:
-            log.exception("Fallo al iniciar el polling de Telegram")
-
-    # 1) Telegram en hilo aparte
+def start_servers():
+    # Telegram en hilo aparte
     t = threading.Thread(target=_start_telegram_polling, name="tg-polling", daemon=True)
     t.start()
 
-    # 2) Flask para Railway (escucha HTTP)
+    # Flask (Railway)
+    from waitress import serve
+    port = int(os.getenv("PORT", "8080"))
     log.info(f"Sirviendo Flask en 0.0.0.0:{port}")
     serve(app_flask, host="0.0.0.0", port=port)
+
+
+# ------------- Gunicorn factory (opcional) -------
+def create_app():
+    """Si tu Procfile usa factory: 'recharge_bot:create_app()'."""
+    start_servers()
+    return app_flask
+
+
+# -------------------- MAIN LOCAL -----------------
+if __name__ == "__main__":
+    start_servers()
