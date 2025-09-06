@@ -3,8 +3,10 @@ gunicorn==21.2.0
 waitress==2.1.2
 
 python-telegram-bot==20.7
+httpx==0.25.2
+
 supabase==2.3.4
-httpx==0.25.2          # <- clave para evitar el conflicto de versiones
+gotrue==2.4.4
 
 mercadopago==2.2.0
 qrcode==7.4.2
