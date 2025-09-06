@@ -223,28 +223,27 @@ async def notify_user(user_id: int, amount_paid: float, added: int, new_total: i
         log.warning("No pude notificar al usuario.")
 
 # ========= MAIN =========
-import threading
+if __name__ == "__main__":
+    import threading
+    from waitress import serve
 
-def _start_telegram_polling():
-    """
-    Arranca el bot de Telegram en un hilo dedicado.
-    run_polling() maneja su propio event loop, por eso NO lo metemos en asyncio del webserver.
-    """
-    try:
-        # close_loop=True permite a PTB cerrar su propio loop cuando el hilo finalice
-        tg_app.run_polling(close_loop=True)
-    except Exception:
-        log.exception("Fallo al iniciar el polling de Telegram")
+    port = int(os.getenv("PORT", "8080"))
 
-# Inicia el hilo del bot apenas se importa el módulo (sirve para Gunicorn)
-if os.getenv("ENABLE_TG", "1") == "1":
+    def _start_telegram_polling():
+        """Arranca el bot en un hilo con su propio event loop."""
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            log.info("Iniciando polling de Telegram…")
+            # PTB v20 crea y usa este loop; al cerrarlo libera recursos.
+            tg_app.run_polling(close_loop=True)
+        except Exception:
+            log.exception("Fallo al iniciar el polling de Telegram")
+
+    # 1) Telegram en hilo aparte
     t = threading.Thread(target=_start_telegram_polling, name="tg-polling", daemon=True)
     t.start()
-    log.info("Hilo de Telegram iniciado")
 
-# Exponer Flask para Gunicorn
-# En Railway usamos el Procfile con:  web: gunicorn recharge_bot:app_flask --threads 2 --timeout 0
-# Para ejecución local directa, dejamos un run básico:
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
-    app_flask.run(host="0.0.0.0", port=port)
+    # 2) Flask para Railway (escucha HTTP)
+    log.info(f"Sirviendo Flask en 0.0.0.0:{port}")
+    serve(app_flask, host="0.0.0.0", port=port)
