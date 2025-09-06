@@ -1,1 +1,1 @@
-web: python recharge_bot.py
+start: python recharge_bot.py
