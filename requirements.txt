@@ -1,15 +1,5 @@
-# Web API para recargas
 flask==3.0.3
 gunicorn==21.2.0
-
-# Mercado Pago SDK (Python)
 mercadopago==2.2.0
-
-# Supabase (solo cliente REST y auth sync)
 supabase==2.3.4
-
-# Compatibilidad que exige supabase
-httpx==0.26.1
-
-# Utilidades
 python-dotenv==1.0.1
