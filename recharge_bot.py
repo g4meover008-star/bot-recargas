@@ -7,59 +7,68 @@ import threading
 from datetime import datetime
 
 import qrcode
+import httpx
 from flask import Flask, request, jsonify
 from mercadopago import SDK
 from supabase import create_client, Client
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
 # -------------------- LOGGING --------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("recargas")
 
-# -------------------- ENV -----------------------
-TG_BOT_TOKEN   = os.getenv("TG_RECHARGE_BOT_TOKEN", "")
-SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY   = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_API_KEY") or ""
+# -------------------- ENV --------------------
+TG_BOT_TOKEN = os.getenv("TG_RECHARGE_BOT_TOKEN", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_API_KEY") or ""
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")       # ej: https://web-production-xxxx.up.railway.app
-CURRENCY        = os.getenv("CURRENCY", "PEN")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")   # ej: https://web-production-xxxx.up.railway.app
+CURRENCY = os.getenv("CURRENCY", "PEN")
 PRICE_PER_CREDIT = float(os.getenv("PRICE_PER_CREDIT", "1"))
 
-REQUIRED_VARS = [TG_BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY, MP_ACCESS_TOKEN, PUBLIC_BASE_URL]
-if not all(REQUIRED_VARS):
+if not (TG_BOT_TOKEN and SUPABASE_URL and SUPABASE_KEY and MP_ACCESS_TOKEN and PUBLIC_BASE_URL):
     raise SystemExit(
         "Faltan variables de entorno: TG_RECHARGE_BOT_TOKEN, SUPABASE_URL, "
         "SUPABASE_ANON_KEY/SUPABASE_API_KEY, MP_ACCESS_TOKEN, PUBLIC_BASE_URL"
     )
 
-# -------------------- CLIENTES -------------------
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Apaga proxies heredados (causan el error 'unexpected keyword argument proxy')
+for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+    os.environ.pop(_k, None)
+
+# -------------------- CLIENTES --------------------
+# Forzamos un httpx.Client propio para Supabase (evita que gotrue cree otro con 'proxy=')
+_httpx = httpx.Client(timeout=30.0)
+
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_KEY,
+    options={"http_client": _httpx},
+)
+
 mp = SDK(MP_ACCESS_TOKEN)
 app_flask = Flask(__name__)
 
-# Telegram Application
+# Telegram app global
 tg_app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
 
-
-# -------------------- DB HELPERS -----------------
+# -------------------- DB helpers --------------------
 def pagos_upsert(pago_id: str, user_id: str, username: str, amount: float, pref_id: str, init_point: str):
-    supabase.table("pagos").upsert({
-        "id": pago_id,
-        "user_id": str(user_id),
-        "username": username,
-        "amount": amount,
-        "status": "pendiente",
-        "preference_id": pref_id,
-        "init_point": init_point,
-        "created_at": datetime.utcnow().isoformat()
-    }, on_conflict="id").execute()
+    supabase.table("pagos").upsert(
+        {
+            "id": pago_id,
+            "user_id": str(user_id),
+            "username": username,
+            "amount": amount,
+            "status": "pendiente",
+            "preference_id": pref_id,
+            "init_point": init_point,
+            "created_at": datetime.utcnow().isoformat(),
+        },
+        on_conflict="id",
+    ).execute()
 
 def pagos_set_status(pago_id: str, new_status: str, payment_id: str | None = None):
     data = {"status": new_status, "updated_at": datetime.utcnow().isoformat()}
@@ -72,33 +81,32 @@ def pagos_get(pago_id: str):
     return r.data[0] if r.data else None
 
 def user_add_credits(user_id: str, amount_paid: float):
+    """1 sol = 1 crédito (o ajusta con PRICE_PER_CREDIT)."""
     r = supabase.table("usuarios").select("creditos").eq("telegram_id", str(user_id)).limit(1).execute()
     current = int(r.data[0]["creditos"]) if r.data and r.data[0].get("creditos") is not None else 0
     to_add = int(round(amount_paid / PRICE_PER_CREDIT))
     new_value = current + to_add
     supabase.table("usuarios").update({"creditos": new_value}).eq("telegram_id", str(user_id)).execute()
-    # opcional historial
+    # Historial (opcional, ignora errores)
     try:
-        supabase.table("creditos_historial").insert({
-            "usuario_id": str(user_id),
-            "delta": to_add,
-            "motivo": "recarga_mp",
-            "hecho_por": "mercado_pago"
-        }).execute()
+        supabase.table("creditos_historial").insert(
+            {"usuario_id": str(user_id), "delta": to_add, "motivo": "recarga_mp", "hecho_por": "mercado_pago"}
+        ).execute()
     except Exception:
         pass
     return to_add, new_value
 
-
-# -------------------- MP HELPERS -----------------
+# -------------------- MP helpers --------------------
 def mp_create_preference(pago_id: str, amount: float):
     pref = {
-        "items": [{
-            "title": "Recarga de créditos",
-            "quantity": 1,
-            "currency_id": CURRENCY,
-            "unit_price": float(amount),
-        }],
+        "items": [
+            {
+                "title": "Recarga de créditos",
+                "quantity": 1,
+                "currency_id": CURRENCY,
+                "unit_price": float(amount),
+            }
+        ],
         "external_reference": pago_id,
         "notification_url": f"{PUBLIC_BASE_URL}/mp/webhook",
     }
@@ -108,19 +116,14 @@ def mp_create_preference(pago_id: str, amount: float):
 def mp_get_payment(payment_id: str):
     return mp.payment().get(payment_id)
 
-
-# -------------------- UTILS ----------------------
+# -------------------- QR --------------------
 def build_qr_png_bytes(url: str) -> bytes:
     img = qrcode.make(url)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-
-# -------------------- TELEGRAM HANDLERS ----------
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong ✅")
-
+# -------------------- TELEGRAM --------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Bot de Recargas\n"
@@ -130,6 +133,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/recargar 10 (10 soles)\n\n"
         "Te daré un link de pago (y QR). Cuando MP apruebe, acreditaré créditos."
     )
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong ✅")
 
 async def cmd_recargar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -148,15 +154,17 @@ async def cmd_recargar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pref_id, init_point = mp_create_preference(pago_id, amount)
     pagos_upsert(pago_id, str(user.id), user.username or "", amount, pref_id, init_point)
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💳 Pagar ahora", url=init_point)],
-        [InlineKeyboardButton("🧾 Ver QR", callback_data=f"qr:{pago_id}")],
-    ])
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💳 Pagar ahora", url=init_point)],
+            [InlineKeyboardButton("🧾 Ver QR", callback_data=f"qr:{pago_id}")],
+        ]
+    )
     await update.message.reply_text(
         f"🔗 Link de pago por {amount:.2f} {CURRENCY}\n"
         f"Pedido: <code>{pago_id}</code>\n\n"
         "Si prefieres QR, pulsa “Ver QR”.",
-        reply_markup=kb
+        reply_markup=kb,
     )
 
 async def on_qr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -177,18 +185,12 @@ async def on_qr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     png = build_qr_png_bytes(init_point)
     await q.message.reply_photo(png, caption="Escanea para pagar (es el mismo link).")
 
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Error en handler", exc_info=context.error)
-
-# registra handlers
-tg_app.add_handler(CommandHandler("ping", cmd_ping))
 tg_app.add_handler(CommandHandler("start", cmd_start))
+tg_app.add_handler(CommandHandler("ping", cmd_ping))
 tg_app.add_handler(CommandHandler("recargar", cmd_recargar))
 tg_app.add_handler(CallbackQueryHandler(on_qr_callback, pattern=r"^qr:"))
-tg_app.add_error_handler(on_error)
 
-
-# -------------------- FLASK ----------------------
+# -------------------- FLASK --------------------
 @app_flask.get("/health")
 def health():
     return "ok", 200
@@ -221,6 +223,7 @@ def mp_webhook():
         if not pedido:
             return jsonify({"status": "unknown order"}), 200
 
+        # Idempotencia
         if pedido.get("status") == "aprobado":
             return jsonify({"status": "already processed"}), 200
 
@@ -228,15 +231,27 @@ def mp_webhook():
             pagos_set_status(ext_ref, "aprobado", payment_id)
             user_id = pedido["user_id"]
             added, new_total = user_add_credits(user_id, amount)
-            asyncio.get_event_loop().create_task(
-                notify_user(int(user_id), amount, added, new_total)
-            )
+            # Notifica por Telegram (no bloquea)
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = None
+            if loop and loop.is_running():
+                loop.create_task(notify_user(int(user_id), amount, added, new_total))
+            else:
+                # fallback: lanza un hilo con su propio loop
+                def _notify():
+                    ll = asyncio.new_event_loop()
+                    asyncio.set_event_loop(ll)
+                    ll.run_until_complete(notify_user(int(user_id), amount, added, new_total))
+                    ll.close()
+                threading.Thread(target=_notify, daemon=True).start()
+
             return jsonify({"status": "ok"}), 200
 
         elif status in ("rejected", "cancelled", "refunded", "charged_back"):
             pagos_set_status(ext_ref, status, payment_id)
             return jsonify({"status": status}), 200
-
         else:
             pagos_set_status(ext_ref, status, payment_id)
             return jsonify({"status": status}), 200
@@ -244,7 +259,6 @@ def mp_webhook():
     except Exception as e:
         log.exception("Error en webhook")
         return jsonify({"error": str(e)}), 500
-
 
 async def notify_user(user_id: int, amount_paid: float, added: int, new_total: int):
     try:
@@ -258,37 +272,40 @@ async def notify_user(user_id: int, amount_paid: float, added: int, new_total: i
     except Exception:
         log.warning("No pude notificar al usuario.")
 
-
-# -------------------- SERVIDORES -----------------
-def _start_telegram_polling():
-    """Arranca PTB en un hilo con su propio event loop."""
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        log.info("Iniciando polling de Telegram…")
-        tg_app.run_polling(drop_pending_updates=True, close_loop=True)
-    except Exception:
-        log.exception("Fallo al iniciar el polling de Telegram")
-
-def start_servers():
-    # Telegram en hilo aparte
-    t = threading.Thread(target=_start_telegram_polling, name="tg-polling", daemon=True)
-    t.start()
-
-    # Flask (Railway)
-    from waitress import serve
-    port = int(os.getenv("PORT", "8080"))
-    log.info(f"Sirviendo Flask en 0.0.0.0:{port}")
-    serve(app_flask, host="0.0.0.0", port=port)
-
-
-# ------------- Gunicorn factory (opcional) -------
+# -------------------- FACTORY PARA GUNICORN --------------------
 def create_app():
-    """Si tu Procfile usa factory: 'recharge_bot:create_app()'."""
-    start_servers()
+    """
+    Usado por Gunicorn. Arranca Telegram en un hilo aparte
+    y devuelve la app Flask para Railway.
+    """
+    def _start_telegram_polling():
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            log.info("Iniciando polling de Telegram…")
+            tg_app.run_polling(close_loop=True)
+        except Exception:
+            log.exception("Fallo al iniciar el polling de Telegram")
+
+    threading.Thread(target=_start_telegram_polling, name="tg-polling", daemon=True).start()
     return app_flask
 
-
-# -------------------- MAIN LOCAL -----------------
+# -------------------- MAIN (ejecución local) --------------------
 if __name__ == "__main__":
-    start_servers()
+    from waitress import serve
+    port = int(os.getenv("PORT", "8080"))
+
+    # Telegram en hilo separado
+    def _start_telegram_polling_local():
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            log.info("Iniciando polling de Telegram (local)…")
+            tg_app.run_polling(close_loop=True)
+        except Exception:
+            log.exception("Fallo al iniciar el polling de Telegram")
+
+    threading.Thread(target=_start_telegram_polling_local, name="tg-polling", daemon=True).start()
+
+    log.info(f"Sirviendo Flask en 0.0.0.0:{port}")
+    serve(app_flask, host="0.0.0.0", port=port)
