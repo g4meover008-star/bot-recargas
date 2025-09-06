@@ -1,1 +1,1 @@
-web: gunicorn -k gthread -w 1 -b 0.0.0.0:$PORT recharge_bot:app
+web: python recharge_bot.py

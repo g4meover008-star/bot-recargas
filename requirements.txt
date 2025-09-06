@@ -1,16 +1,8 @@
-Flask==3.0.3
-gunicorn==21.2.0
-
-# Telegram bot
-python-telegram-bot==20.7
-httpx==0.25.2
-
-# Mercado Pago
+flask==3.0.3
+waitress==3.0.0
 mercadopago==2.2.0
-
-# Supabase
+python-telegram-bot==20.7
 supabase==2.3.4
-
-# Utilidades
+httpx>=0.26,<0.28
 qrcode==7.4.2
 Pillow==10.4.0
