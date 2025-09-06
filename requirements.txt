@@ -1,5 +1,8 @@
-flask==3.0.3
+Flask==3.0.3
 gunicorn==21.2.0
 mercadopago==2.2.0
 supabase==2.3.4
+httpx==0.25.2
+qrcode==7.4.2
+Pillow==10.4.0
 python-dotenv==1.0.1
