@@ -5,10 +5,8 @@ requests==2.31.0
 mercadopago==2.2.3
 
 supabase==2.3.4
-# realtime  ->  NO fijar (lo instala supabase con versión <2.0.0)
-
+# NO fijes realtime (lo trae supabase)
 qrcode==7.4.2
 Pillow==10.4.0
 
-python-telegram-bot==20.7
-httpx==0.25.2
+httpx==0.27.2
