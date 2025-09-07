@@ -10,18 +10,14 @@ import qrcode
 import httpx
 from flask import Flask, request, jsonify
 from mercadopago import SDK
+from supabase import create_client, Client
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
-from supabase import create_client, Client
-from supabase.client import ClientOptions
-
-
 # -------------------- LOGGING --------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("recargas")
-
 
 # -------------------- ENV --------------------
 TG_BOT_TOKEN = os.getenv("TG_RECHARGE_BOT_TOKEN", "")
@@ -38,27 +34,25 @@ if not (TG_BOT_TOKEN and SUPABASE_URL and SUPABASE_KEY and MP_ACCESS_TOKEN and P
         "SUPABASE_ANON_KEY/SUPABASE_API_KEY, MP_ACCESS_TOKEN, PUBLIC_BASE_URL"
     )
 
-# Apaga proxies heredados (evitaba errores en gotrue/supabase con 'proxy=')
+# Apaga proxies heredados que rompen gotrue/httpx
 for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
     os.environ.pop(_k, None)
 
+# Parche pequeño: si alguna lib usa httpx.Client(proxy=...), lo convertimos a proxies=
+_OrigClient = httpx.Client
+def _PatchedClient(*args, **kwargs):
+    if "proxy" in kwargs:
+        kwargs["proxies"] = kwargs.pop("proxy")
+    return _OrigClient(*args, **kwargs)
+httpx.Client = _PatchedClient  # type: ignore
 
 # -------------------- CLIENTES --------------------
-# httpx.Client propio para el SDK de Supabase
-_httpx = httpx.Client(timeout=30.0)
-
-supabase: Client = create_client(
-    SUPABASE_URL,
-    SUPABASE_KEY,
-    options=ClientOptions(http_client=_httpx, headers={}),
-)
-
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 mp = SDK(MP_ACCESS_TOKEN)
 app_flask = Flask(__name__)
 
 # Telegram app global
 tg_app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
-
 
 # -------------------- DB helpers --------------------
 def pagos_upsert(pago_id: str, user_id: str, username: str, amount: float, pref_id: str, init_point: str):
@@ -87,7 +81,7 @@ def pagos_get(pago_id: str):
     return r.data[0] if r.data else None
 
 def user_add_credits(user_id: str, amount_paid: float):
-    """1 sol = 1 crédito (ajustable con PRICE_PER_CREDIT)."""
+    """1 sol = 1 crédito (o ajusta con PRICE_PER_CREDIT)."""
     r = supabase.table("usuarios").select("creditos").eq("telegram_id", str(user_id)).limit(1).execute()
     current = int(r.data[0]["creditos"]) if r.data and r.data[0].get("creditos") is not None else 0
     to_add = int(round(amount_paid / PRICE_PER_CREDIT))
@@ -101,7 +95,6 @@ def user_add_credits(user_id: str, amount_paid: float):
     except Exception:
         pass
     return to_add, new_value
-
 
 # -------------------- MP helpers --------------------
 def mp_create_preference(pago_id: str, amount: float):
@@ -123,14 +116,12 @@ def mp_create_preference(pago_id: str, amount: float):
 def mp_get_payment(payment_id: str):
     return mp.payment().get(payment_id)
 
-
 # -------------------- QR --------------------
 def build_qr_png_bytes(url: str) -> bytes:
     img = qrcode.make(url)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
-
 
 # -------------------- TELEGRAM --------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -199,7 +190,6 @@ tg_app.add_handler(CommandHandler("ping", cmd_ping))
 tg_app.add_handler(CommandHandler("recargar", cmd_recargar))
 tg_app.add_handler(CallbackQueryHandler(on_qr_callback, pattern=r"^qr:"))
 
-
 # -------------------- FLASK --------------------
 @app_flask.get("/health")
 def health():
@@ -241,8 +231,7 @@ def mp_webhook():
             pagos_set_status(ext_ref, "aprobado", payment_id)
             user_id = pedido["user_id"]
             added, new_total = user_add_credits(user_id, amount)
-
-            # Notifica por Telegram (no bloquea)
+            # Notifica por Telegram (sin bloquear el request)
             try:
                 loop = asyncio.get_event_loop()
             except RuntimeError:
@@ -250,7 +239,7 @@ def mp_webhook():
             if loop and loop.is_running():
                 loop.create_task(notify_user(int(user_id), amount, added, new_total))
             else:
-                # Fallback: hilo con su propio loop
+                # fallback: hilo con loop propio
                 def _notify():
                     ll = asyncio.new_event_loop()
                     asyncio.set_event_loop(ll)
@@ -263,7 +252,6 @@ def mp_webhook():
         elif status in ("rejected", "cancelled", "refunded", "charged_back"):
             pagos_set_status(ext_ref, status, payment_id)
             return jsonify({"status": status}), 200
-
         else:
             pagos_set_status(ext_ref, status, payment_id)
             return jsonify({"status": status}), 200
@@ -284,7 +272,6 @@ async def notify_user(user_id: int, amount_paid: float, added: int, new_total: i
     except Exception:
         log.warning("No pude notificar al usuario.")
 
-
 # -------------------- FACTORY PARA GUNICORN --------------------
 def create_app():
     """
@@ -302,7 +289,6 @@ def create_app():
 
     threading.Thread(target=_start_telegram_polling, name="tg-polling", daemon=True).start()
     return app_flask
-
 
 # -------------------- MAIN (ejecución local) --------------------
 if __name__ == "__main__":
