@@ -7,7 +7,6 @@ import threading
 from datetime import datetime
 
 import qrcode
-import httpx
 from flask import Flask, request, jsonify
 from mercadopago import SDK
 from supabase import create_client, Client
@@ -24,7 +23,7 @@ TG_BOT_TOKEN = os.getenv("TG_RECHARGE_BOT_TOKEN", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_API_KEY") or ""
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")   # ej: https://web-production-xxxx.up.railway.app
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")   # p. ej. https://web-production-xxxx.up.railway.app
 CURRENCY = os.getenv("CURRENCY", "PEN")
 PRICE_PER_CREDIT = float(os.getenv("PRICE_PER_CREDIT", "1"))
 
@@ -34,24 +33,16 @@ if not (TG_BOT_TOKEN and SUPABASE_URL and SUPABASE_KEY and MP_ACCESS_TOKEN and P
         "SUPABASE_ANON_KEY/SUPABASE_API_KEY, MP_ACCESS_TOKEN, PUBLIC_BASE_URL"
     )
 
-# Apaga proxies heredados que rompen gotrue/httpx
+# Evita que gotrue/httpx lean proxies heredados (que producen el error 'proxy' unexpected)
 for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
     os.environ.pop(_k, None)
-
-# Parche pequeño: si alguna lib usa httpx.Client(proxy=...), lo convertimos a proxies=
-_OrigClient = httpx.Client
-def _PatchedClient(*args, **kwargs):
-    if "proxy" in kwargs:
-        kwargs["proxies"] = kwargs.pop("proxy")
-    return _OrigClient(*args, **kwargs)
-httpx.Client = _PatchedClient  # type: ignore
 
 # -------------------- CLIENTES --------------------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 mp = SDK(MP_ACCESS_TOKEN)
-app_flask = Flask(__name__)
 
-# Telegram app global
+# Flask y Telegram
+app_flask = Flask(__name__)
 tg_app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
 
 # -------------------- DB helpers --------------------
@@ -81,13 +72,13 @@ def pagos_get(pago_id: str):
     return r.data[0] if r.data else None
 
 def user_add_credits(user_id: str, amount_paid: float):
-    """1 sol = 1 crédito (o ajusta con PRICE_PER_CREDIT)."""
+    """1 sol = 1 crédito (ajustable con PRICE_PER_CREDIT)."""
     r = supabase.table("usuarios").select("creditos").eq("telegram_id", str(user_id)).limit(1).execute()
     current = int(r.data[0]["creditos"]) if r.data and r.data[0].get("creditos") is not None else 0
     to_add = int(round(amount_paid / PRICE_PER_CREDIT))
     new_value = current + to_add
     supabase.table("usuarios").update({"creditos": new_value}).eq("telegram_id", str(user_id)).execute()
-    # Historial (opcional)
+    # Historial opcional
     try:
         supabase.table("creditos_historial").insert(
             {"usuario_id": str(user_id), "delta": to_add, "motivo": "recarga_mp", "hecho_por": "mercado_pago"}
@@ -231,7 +222,7 @@ def mp_webhook():
             pagos_set_status(ext_ref, "aprobado", payment_id)
             user_id = pedido["user_id"]
             added, new_total = user_add_credits(user_id, amount)
-            # Notifica por Telegram (sin bloquear el request)
+            # Notifica por Telegram (no bloquea)
             try:
                 loop = asyncio.get_event_loop()
             except RuntimeError:
@@ -239,7 +230,7 @@ def mp_webhook():
             if loop and loop.is_running():
                 loop.create_task(notify_user(int(user_id), amount, added, new_total))
             else:
-                # fallback: hilo con loop propio
+                # fallback: lanza un hilo con su propio loop
                 def _notify():
                     ll = asyncio.new_event_loop()
                     asyncio.set_event_loop(ll)
@@ -283,7 +274,8 @@ def create_app():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             log.info("Iniciando polling de Telegram…")
-            tg_app.run_polling(close_loop=True)
+            # EVITA set_wakeup_fd en hilo
+            tg_app.run_polling(close_loop=True, stop_signals=())
         except Exception:
             log.exception("Fallo al iniciar el polling de Telegram")
 
@@ -295,13 +287,13 @@ if __name__ == "__main__":
     from waitress import serve
     port = int(os.getenv("PORT", "8080"))
 
-    # Telegram en hilo separado
     def _start_telegram_polling_local():
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             log.info("Iniciando polling de Telegram (local)…")
-            tg_app.run_polling(close_loop=True)
+            # EVITA set_wakeup_fd en hilo
+            tg_app.run_polling(close_loop=True, stop_signals=())
         except Exception:
             log.exception("Fallo al iniciar el polling de Telegram")
 
