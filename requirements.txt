@@ -1,17 +1,9 @@
 Flask==3.0.3
 gunicorn==21.2.0
 waitress==2.1.2
-qrcode
-Pillow
-
-# Telegram
-python-telegram-bot==20.7
-
-# Supabase (versiones compatibles con httpx<0.26)
+qrcode==7.4.2
+Pillow==10.4.0
+mercadopago==2.2.0
 supabase==2.3.4
-
-# MercadoPago SDK
-mercadopago
-
-# Forzamos rango compatible de httpx (evita el conflicto del build)
+python-telegram-bot==20.7
 httpx>=0.25.2,<0.26
