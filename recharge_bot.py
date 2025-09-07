@@ -1,3 +1,4 @@
+# recharge_bot.py
 import os
 import io
 import uuid
@@ -5,79 +6,76 @@ import asyncio
 import logging
 import threading
 from datetime import datetime
+from typing import Optional
 
-import httpx
 import qrcode
 from flask import Flask, request, jsonify
 from mercadopago import SDK
 from supabase import create_client, Client
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Bot as TgBot,
+)
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
+
 # -------------------- LOGGING --------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 log = logging.getLogger("recargas")
 
+
 # -------------------- ENV --------------------
-TG_BOT_TOKEN = os.getenv("TG_RECHARGE_BOT_TOKEN", "")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_API_KEY") or ""
-MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # ej: https://web-production-xxxx.up.railway.app
+def _env(name: str, default: str = "") -> str:
+    v = os.getenv(name, default)
+    return v.strip() if isinstance(v, str) else default
 
-CURRENCY = os.getenv("CURRENCY", "PEN")
-PRICE_PER_CREDIT = float(os.getenv("PRICE_PER_CREDIT", "1"))
-PRICE_PER_ACCOUNT = float(os.getenv("PRICE_PER_ACCOUNT", "25"))  # <<< nuevo
-BRAND_NAME = os.getenv("BRAND_NAME", "Netflix_M4CRO")           # <<< opcional
 
-# Notificación al bot principal
-ADMIN_BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN", "")              # <<< nuevo (token del bot principal)
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")                  # <<< nuevo (chat_id donde avisa)
+TG_BOT_TOKEN = _env("TG_RECHARGE_BOT_TOKEN")
+SUPABASE_URL = _env("SUPABASE_URL")
+SUPABASE_KEY = _env("SUPABASE_API_KEY") or _env("SUPABASE_ANON_KEY")
+MP_ACCESS_TOKEN = _env("MP_ACCESS_TOKEN")
+PUBLIC_BASE_URL = _env("PUBLIC_BASE_URL")  # ej: https://web-production-xxxx.up.railway.app
+
+CURRENCY = _env("CURRENCY", "PEN")
+PRICE_PER_CREDIT = float(_env("PRICE_PER_CREDIT", "1"))
+
+# Opcional (para notificar al bot principal / admin)
+ADMIN_BOT_TOKEN = _env("ADMIN_BOT_TOKEN")   # token del bot que recibirá las notificaciones
+ADMIN_CHAT_ID = _env("ADMIN_CHAT_ID")       # chat_id (numérico) donde avisar
+BRAND_NAME = _env("BRAND_NAME", "Bot de Recargas")
 
 if not (TG_BOT_TOKEN and SUPABASE_URL and SUPABASE_KEY and MP_ACCESS_TOKEN and PUBLIC_BASE_URL):
     raise SystemExit(
         "Faltan variables de entorno: TG_RECHARGE_BOT_TOKEN, SUPABASE_URL, "
-        "SUPABASE_ANON_KEY/SUPABASE_API_KEY, MP_ACCESS_TOKEN, PUBLIC_BASE_URL"
+        "SUPABASE_API_KEY/SUPABASE_ANON_KEY, MP_ACCESS_TOKEN, PUBLIC_BASE_URL"
     )
 
-# Limpia proxies heredados (evita 'unexpected keyword argument proxy' en httpx/gotrue)
+# Por si el entorno trae proxies heredados que rompen httpx/requests
 for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
     os.environ.pop(_k, None)
 
+
 # -------------------- CLIENTES --------------------
-_httpx = httpx.Client(timeout=30.0)
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options={"http_client": _httpx})
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)  # <- SIN 'options', así funciona bien
 mp = SDK(MP_ACCESS_TOKEN)
 app_flask = Flask(__name__)
-
-# Telegram app global
 tg_app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
 
-# -------------------- HELPERS --------------------
-def build_qr_png_bytes(url: str) -> bytes:
-    img = qrcode.make(url)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
-def pesos(amount: float) -> str:
-    return f"{amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-def notify_admin_sync(text: str) -> None:
-    """Usa el BOT PRINCIPAL (ADMIN_BOT_TOKEN) para mandar mensajes a ADMIN_CHAT_ID."""
-    if not (ADMIN_BOT_TOKEN and ADMIN_CHAT_ID):
-        return
+_admin_bot: Optional[TgBot] = None
+if ADMIN_BOT_TOKEN and ADMIN_CHAT_ID:
     try:
-        api = f"https://api.telegram.org/bot{ADMIN_BOT_TOKEN}/sendMessage"
-        _httpx.post(api, json={"chat_id": ADMIN_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=20)
+        _admin_bot = TgBot(ADMIN_BOT_TOKEN)
+        log.info("Admin bot configurado para notificaciones.")
     except Exception:
-        log.warning("No pude notificar al admin.", exc_info=True)
+        log.exception("No pude inicializar el admin bot.")
 
-def notify_admin_bg(text: str) -> None:
-    threading.Thread(target=notify_admin_sync, args=(text,), daemon=True).start()
 
-# -------------------- DB helpers --------------------
+# -------------------- HELPERS DB --------------------
 def pagos_upsert(pago_id: str, user_id: str, username: str, amount: float, pref_id: str, init_point: str):
     supabase.table("pagos").upsert(
         {
@@ -93,15 +91,18 @@ def pagos_upsert(pago_id: str, user_id: str, username: str, amount: float, pref_
         on_conflict="id",
     ).execute()
 
-def pagos_set_status(pago_id: str, new_status: str, payment_id: str | None = None):
+
+def pagos_set_status(pago_id: str, new_status: str, payment_id: Optional[str] = None):
     data = {"status": new_status, "updated_at": datetime.utcnow().isoformat()}
     if payment_id:
         data["payment_id"] = str(payment_id)
     supabase.table("pagos").update(data).eq("id", pago_id).execute()
 
+
 def pagos_get(pago_id: str):
     r = supabase.table("pagos").select("*").eq("id", pago_id).limit(1).execute()
     return r.data[0] if r.data else None
+
 
 def user_add_credits(user_id: str, amount_paid: float):
     r = supabase.table("usuarios").select("creditos").eq("telegram_id", str(user_id)).limit(1).execute()
@@ -111,35 +112,28 @@ def user_add_credits(user_id: str, amount_paid: float):
     supabase.table("usuarios").update({"creditos": new_value}).eq("telegram_id", str(user_id)).execute()
     try:
         supabase.table("creditos_historial").insert(
-            {"usuario_id": str(user_id), "delta": to_add, "motivo": "recarga_mp", "hecho_por": "mercado_pago"}
+            {
+                "usuario_id": str(user_id),
+                "delta": to_add,
+                "motivo": "recarga_mp",
+                "hecho_por": "mercado_pago",
+            }
         ).execute()
     except Exception:
         pass
     return to_add, new_value
 
-def compras_insert(order_id: str, user_id: str, username: str, qty: int, unit_price: float, total: float):
-    """Tabla opcional 'compras' para registrar la intención de compra (manual)."""
-    try:
-        supabase.table("compras").insert(
-            {
-                "id": order_id,
-                "user_id": str(user_id),
-                "username": username,
-                "cantidad": qty,
-                "precio_unit": unit_price,
-                "total": total,
-                "status": "pendiente",
-                "created_at": datetime.utcnow().isoformat(),
-            }
-        ).execute()
-    except Exception:
-        pass
 
-# -------------------- Mercado Pago helpers --------------------
+# -------------------- HELPERS MP --------------------
 def mp_create_preference(pago_id: str, amount: float):
     pref = {
         "items": [
-            {"title": "Recarga de créditos", "quantity": 1, "currency_id": CURRENCY, "unit_price": float(amount)}
+            {
+                "title": f"{BRAND_NAME} - Recarga de créditos",
+                "quantity": 1,
+                "currency_id": CURRENCY,
+                "unit_price": float(amount),
+            }
         ],
         "external_reference": pago_id,
         "notification_url": f"{PUBLIC_BASE_URL}/mp/webhook",
@@ -147,78 +141,68 @@ def mp_create_preference(pago_id: str, amount: float):
     resp = mp.preference().create(pref)
     return resp["response"]["id"], resp["response"]["init_point"]
 
+
 def mp_get_payment(payment_id: str):
     return mp.payment().get(payment_id)
 
+
+# -------------------- QR --------------------
+def build_qr_png_bytes(url: str) -> bytes:
+    img = qrcode.make(url)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+# -------------------- NOTIFICACIONES --------------------
+async def notify_user(user_id: int, amount_paid: float, added: int, new_total: int):
+    try:
+        text = (
+            f"✅ <b>Recarga acreditada</b>\n"
+            f"Monto: {amount_paid:.2f} {CURRENCY}\n"
+            f"Créditos añadidos: <b>{added}</b>\n"
+            f"Saldo actual: <b>{new_total}</b>"
+        )
+        await tg_app.bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
+    except Exception:
+        log.warning("No pude notificar al usuario.")
+
+
+def notify_admin_sync(text: str):
+    if not (_admin_bot and ADMIN_CHAT_ID):
+        return
+    try:
+        _admin_bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        log.warning("No pude notificar al admin.")
+
+
 # -------------------- TELEGRAM CMDS --------------------
-WELCOME_TEXT = (
-    f"👋 Bienvenido a <b>{BRAND_NAME}</b>.\n"
-    f"Tarifa: <b>{pesos(PRICE_PER_ACCOUNT)} {CURRENCY}</b> por cuenta.\n\n"
-    "Selecciona una opción:\n"
-    "• <code>/comprar 1</code> (o la cantidad que desees)\n"
-    "• <code>/recargar 10</code> (recarga de créditos por Mercado Pago)\n"
-    "• <code>/ping</code> (prueba rápida)"
+WELCOME = (
+    f"👋 Bienvenido a <b>{BRAND_NAME}</b>\n\n"
+    f"Tarifa: <b>{PRICE_PER_CREDIT:.2f} {CURRENCY}</b> por crédito.\n\n"
+    "Usa <code>/recargar &lt;monto&gt;</code>\n"
+    "Ejemplos:\n"
+    "<code>/recargar 5</code> (5 soles)\n"
+    "<code>/recargar 10</code> (10 soles)\n\n"
+    "Te daré un link de pago (y QR). Cuando MP apruebe, acreditaré créditos."
 )
 
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Créditos", callback_data="menu:creditos")]])
-    await update.message.reply_text(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb)
+    await update.message.reply_text(WELCOME, parse_mode="HTML")
+
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
 
-async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data == "menu:creditos":
-        await q.message.reply_text("Usa /recargar <monto> para recargar créditos. Ej: /recargar 10")
-
-async def cmd_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Uso: /comprar <cantidad>"""
-    user = update.effective_user
-    if len(context.args) != 1:
-        await update.message.reply_text("Uso: /comprar <cantidad>\nEj: /comprar 1")
-        return
-    try:
-        qty = int(context.args[0])
-        if qty <= 0:
-            raise ValueError()
-    except Exception:
-        await update.message.reply_text("Cantidad inválida. Ej: /comprar 1")
-        return
-
-    total = PRICE_PER_ACCOUNT * qty
-    order_id = str(uuid.uuid4())
-
-    # Opcional: registra la intención
-    compras_insert(order_id, str(user.id), user.username or "", qty, PRICE_PER_ACCOUNT, total)
-
-    # Mensaje al usuario (estilo ejemplo)
-    text_user = (
-        f"Ok, el precio por cada cuenta es <b>{pesos(PRICE_PER_ACCOUNT)} {CURRENCY}</b>.\n"
-        f"El monto total a enviar es <b>{pesos(total)} {CURRENCY}</b>.\n\n"
-        "Cuando completes el pago, envía el <b>comprobante</b> por aquí para validarlo. "
-        "Si tienes dudas, escribe /start."
-    )
-    await update.message.reply_text(text_user, parse_mode="HTML")
-
-    # Notifica al admin por el BOT PRINCIPAL
-    username = f"@{user.username}" if user.username else f"(id {user.id})"
-    admin_msg = (
-        f"🆕 <b>Nueva solicitud de compra</b>\n"
-        f"Usuario: {username}\n"
-        f"Order ID: <code>{order_id}</code>\n"
-        f"Cantidad: <b>{qty}</b>\n"
-        f"Unit: <b>{pesos(PRICE_PER_ACCOUNT)} {CURRENCY}</b>\n"
-        f"Total: <b>{pesos(total)} {CURRENCY}</b>"
-    )
-    notify_admin_bg(admin_msg)
 
 async def cmd_recargar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if len(context.args) != 1:
         await update.message.reply_text("Uso: /recargar <monto_en_soles>\nEj: /recargar 5")
         return
+
     try:
         amount = float(context.args[0])
         if amount <= 0:
@@ -238,12 +222,22 @@ async def cmd_recargar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     )
     await update.message.reply_text(
-        f"🔗 Link de pago por {pesos(amount)} {CURRENCY}\n"
+        f"🔗 Link de pago por {amount:.2f} {CURRENCY}\n"
         f"Pedido: <code>{pago_id}</code>\n\n"
         "Si prefieres QR, pulsa “Ver QR”.",
         reply_markup=kb,
         parse_mode="HTML",
     )
+
+    # Aviso al admin (opcional)
+    notify_admin_sync(
+        f"🆕 <b>Solicitud de recarga</b>\n"
+        f"Usuario: <code>{user.id}</code> @{user.username or '-'}\n"
+        f"Monto: <b>{amount:.2f} {CURRENCY}</b>\n"
+        f"Pedido: <code>{pago_id}</code>\n"
+        f"Link: {init_point}"
+    )
+
 
 async def on_qr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -263,17 +257,18 @@ async def on_qr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     png = build_qr_png_bytes(init_point)
     await q.message.reply_photo(png, caption="Escanea para pagar (es el mismo link).")
 
+
 tg_app.add_handler(CommandHandler("start", cmd_start))
 tg_app.add_handler(CommandHandler("ping", cmd_ping))
-tg_app.add_handler(CommandHandler("comprar", cmd_comprar))
 tg_app.add_handler(CommandHandler("recargar", cmd_recargar))
 tg_app.add_handler(CallbackQueryHandler(on_qr_callback, pattern=r"^qr:"))
-tg_app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^menu:"))
 
-# -------------------- FLASK --------------------
+
+# -------------------- FLASK ROUTES --------------------
 @app_flask.get("/health")
 def health():
     return "ok", 200
+
 
 @app_flask.post("/mp/webhook")
 def mp_webhook():
@@ -309,77 +304,72 @@ def mp_webhook():
 
         if status == "approved":
             pagos_set_status(ext_ref, "aprobado", payment_id)
-            user_id = pedido["user_id"]
-            added, new_total = user_add_credits(user_id, amount)
+            user_id = int(pedido["user_id"])
+            added, new_total = user_add_credits(str(user_id), amount)
 
-            # Notifica al usuario (bot de recargas)
+            # Notifica al usuario (asincrónico, sin bloquear Flask)
             try:
                 loop = asyncio.get_event_loop()
             except RuntimeError:
                 loop = None
+
             if loop and loop.is_running():
-                loop.create_task(notify_user(int(user_id), amount, added, new_total))
+                loop.create_task(notify_user(user_id, amount, added, new_total))
             else:
                 def _notify():
                     ll = asyncio.new_event_loop()
                     asyncio.set_event_loop(ll)
-                    ll.run_until_complete(notify_user(int(user_id), amount, added, new_total))
+                    ll.run_until_complete(notify_user(user_id, amount, added, new_total))
                     ll.close()
                 threading.Thread(target=_notify, daemon=True).start()
 
-            # Notifica al admin (bot principal)
-            notify_admin_bg(
-                f"✅ <b>Recarga acreditada</b>\n"
-                f"User ID: <code>{user_id}</code>\n"
-                f"Monto: <b>{pesos(amount)} {CURRENCY}</b>\n"
-                f"Créditos añadidos: <b>{added}</b>\n"
-                f"Pedido: <code>{ext_ref}</code>"
+            # Aviso al admin
+            notify_admin_sync(
+                f"✅ <b>Pago aprobado</b>\n"
+                f"User: <code>{user_id}</code>\n"
+                f"Monto: {amount:.2f} {CURRENCY}\n"
+                f"Créditos +{added} → saldo {new_total}\n"
+                f"Pedido: <code>{ext_ref}</code>\n"
+                f"PaymentID: <code>{payment_id}</code>"
             )
 
             return jsonify({"status": "ok"}), 200
 
-        elif status in ("rejected", "cancelled", "refunded", "charged_back"):
-            pagos_set_status(ext_ref, status, payment_id)
-            notify_admin_bg(
-                f"⚠️ Estado de pago: <b>{status}</b>\nPedido: <code>{ext_ref}</code>"
-            )
-            return jsonify({"status": status}), 200
         else:
-            pagos_set_status(ext_ref, status, payment_id)
+            pagos_set_status(ext_ref, status or "unknown", payment_id)
+            # Aviso al admin de estados no-aprobados
+            notify_admin_sync(
+                f"ℹ️ <b>Estado de pago</b>: {status}\n"
+                f"Pedido: <code>{ext_ref}</code>\n"
+                f"PaymentID: <code>{payment_id}</code>"
+            )
             return jsonify({"status": status}), 200
 
     except Exception as e:
         log.exception("Error en webhook")
         return jsonify({"error": str(e)}), 500
 
-async def notify_user(user_id: int, amount_paid: float, added: int, new_total: int):
-    try:
-        text = (
-            "✅ <b>Recarga acreditada</b>\n"
-            f"Pago: {pesos(amount_paid)} {CURRENCY}\n"
-            f"Créditos añadidos: <b>{added}</b>\n"
-            f"Saldo actual: <b>{new_total}</b>"
-        )
-        await tg_app.bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
-    except Exception:
-        log.warning("No pude notificar al usuario.")
 
 # -------------------- FACTORY PARA GUNICORN --------------------
 def create_app():
-    """Usado por Gunicorn. Arranca Telegram en un hilo aparte y devuelve Flask."""
+    """
+    Usado por Gunicorn. Arranca Telegram en un hilo y devuelve la app Flask.
+    Evitamos señales en threads con stop_signals=None.
+    """
     def _start_telegram_polling():
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             log.info("Iniciando polling de Telegram…")
-            tg_app.run_polling(close_loop=True)
+            tg_app.run_polling(close_loop=True, stop_signals=None)
         except Exception:
             log.exception("Fallo al iniciar el polling de Telegram")
 
     threading.Thread(target=_start_telegram_polling, name="tg-polling", daemon=True).start()
     return app_flask
 
-# -------------------- MAIN (ejecución local) --------------------
+
+# -------------------- MAIN: ejecución local --------------------
 if __name__ == "__main__":
     from waitress import serve
     port = int(os.getenv("PORT", "8080"))
@@ -389,10 +379,11 @@ if __name__ == "__main__":
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             log.info("Iniciando polling de Telegram (local)…")
-            tg_app.run_polling(close_loop=True)
+            tg_app.run_polling(close_loop=True, stop_signals=None)
         except Exception:
             log.exception("Fallo al iniciar el polling de Telegram")
 
     threading.Thread(target=_start_telegram_polling_local, name="tg-polling", daemon=True).start()
+
     log.info(f"Sirviendo Flask en 0.0.0.0:{port}")
     serve(app_flask, host="0.0.0.0", port=port)
