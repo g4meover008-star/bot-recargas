@@ -5,12 +5,12 @@ qrcode==7.4.2
 Pillow==10.4.0
 mercadopago==2.2.0
 
-# TELEGRAM
-python-telegram-bot==20.7
+# Telegram (compatible con httpx 0.27+)
+python-telegram-bot==21.6
 
-# SUPABASE STACK (alineado a httpx 0.27)
+# Supabase stack alineado a httpx 0.27+
 supabase==2.4.1
 gotrue==2.4.4
 
-# HTTPX NUEVO (con parámetro "proxy")
+# HTTPX con soporte de 'proxy'
 httpx>=0.27,<0.28
