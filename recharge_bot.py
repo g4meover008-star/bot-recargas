@@ -5,14 +5,18 @@ import asyncio
 import logging
 import threading
 from datetime import datetime
-
 from supabase import create_client, Client
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-)
+
+import qrcode
+from flask import Flask, request, jsonify
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
 )
 
 # -------------------- LOGGING --------------------
@@ -22,157 +26,155 @@ log = logging.getLogger("recargas")
 # -------------------- ENV --------------------
 TG_BOT_TOKEN = os.getenv("TG_RECHARGE_BOT_TOKEN", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_API_KEY") or ""
-ADMIN_ID = int(os.getenv("ADMIN_ID", "2016769834"))  # tu ID
+SUPABASE_KEY = os.getenv("SUPABASE_API_KEY", "")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))  # ID de admin
+YAPE_QR_URL = os.getenv("YAPE_QR_URL", "")
+PRICE_PER_CREDIT = float(os.getenv("PRICE_PER_CREDIT", "25"))  # precio por cuenta
 
-PRECIO_POR_CUENTA = 25  # soles = 1 crédito
+if not (TG_BOT_TOKEN and SUPABASE_URL and SUPABASE_KEY and ADMIN_CHAT_ID and YAPE_QR_URL):
+    raise SystemExit("❌ Faltan variables de entorno necesarias")
 
-if not (TG_BOT_TOKEN and SUPABASE_URL and SUPABASE_KEY):
-    raise SystemExit("Faltan variables de entorno")
-
+# -------------------- CLIENTES --------------------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+app_flask = Flask(__name__)
 tg_app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
 
 # -------------------- DB helpers --------------------
-def pedido_insert(user_id, username, cantidad, monto):
-    pid = str(uuid.uuid4())
-    supabase.table("pedidos").insert({
-        "id": pid,
-        "user_id": str(user_id),
-        "username": username,
-        "cantidad": cantidad,
-        "monto": monto,
-        "estado": "pendiente",
-        "created_at": datetime.utcnow().isoformat()
-    }).execute()
-    return pid
+def pagos_upsert(pago_id: str, user_id: str, username: str, cuentas: int, total: float):
+    supabase.table("pagos").upsert(
+        {
+            "id": pago_id,
+            "user_id": str(user_id),
+            "username": username,
+            "cuentas": cuentas,
+            "monto": total,
+            "status": "pendiente",
+            "created_at": datetime.utcnow().isoformat(),
+        },
+        on_conflict="id",
+    ).execute()
 
-def pedido_set_comprobante(pedido_id, url):
-    supabase.table("pedidos").update({"comprobante_url": url}).eq("id", pedido_id).execute()
+def pagos_set_status(pago_id: str, new_status: str):
+    supabase.table("pagos").update(
+        {"status": new_status, "updated_at": datetime.utcnow().isoformat()}
+    ).eq("id", pago_id).execute()
 
-def pedido_set_estado(pedido_id, estado):
-    supabase.table("pedidos").update({"estado": estado}).eq("id", pedido_id).execute()
-
-def user_add_credits(user_id: str, cantidad: int):
+def user_add_credits(user_id: str, cuentas: int):
     r = supabase.table("usuarios").select("creditos").eq("telegram_id", str(user_id)).limit(1).execute()
     current = int(r.data[0]["creditos"]) if r.data and r.data[0].get("creditos") else 0
-    new_value = current + cantidad
+    new_value = current + cuentas
     supabase.table("usuarios").update({"creditos": new_value}).eq("telegram_id", str(user_id)).execute()
     return new_value
 
-# -------------------- Estados temporales --------------------
-user_pending_orders = {}  # user_id -> pedido_id
-
 # -------------------- HANDLERS --------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🟢 Recargar créditos", callback_data="recargar")]
-    ])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Créditos", callback_data="comprar")]])
     await update.message.reply_text(
         "👋 Bienvenido.\n"
-        f"Tarifa: {PRECIO_POR_CUENTA} soles por cuenta.\n\n"
+        f"Tarifa: {PRICE_PER_CREDIT:.2f} PEN por cuenta.\n\n"
         "Selecciona una opción:",
-        reply_markup=kb
+        reply_markup=kb,
     )
 
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-    if q.data == "recargar":
-        await q.message.reply_text("¿Cuántas cuentas deseas comprar? (ej: 2)")
-        context.user_data["awaiting_cantidad"] = True
+    if query.data == "comprar":
+        await query.message.reply_text(
+            f"Tarifa: {PRICE_PER_CREDIT:.2f} PEN por cuenta.\n"
+            "¿Cuántas cuentas deseas comprar?"
+        )
+        context.user_data["esperando_cantidad"] = True
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    text = update.message.text
-
-    if context.user_data.get("awaiting_cantidad"):
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("esperando_cantidad"):
         try:
-            cantidad = int(text)
-            if cantidad <= 0:
+            cuentas = int(update.message.text.strip())
+            if cuentas <= 0:
                 raise ValueError()
-        except:
+
+            total = cuentas * PRICE_PER_CREDIT
+            pago_id = str(uuid.uuid4())
+
+            # Guardar en BD
+            pagos_upsert(pago_id, update.effective_user.id, update.effective_user.username or "", cuentas, total)
+
+            # Enviar QR y pedido
+            await update.message.reply_photo(
+                photo=YAPE_QR_URL,
+                caption=(
+                    f"💳 Pedido: <code>{pago_id}</code>\n"
+                    f"📦 {cuentas} cuentas = {total:.2f} PEN\n\n"
+                    "➡️ Escanea el QR y envía el comprobante aquí mismo."
+                ),
+                parse_mode="HTML",
+            )
+
+            # Notificar al admin
+            kb_admin = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirmar", callback_data=f"confirm:{pago_id}:{update.effective_user.id}:{cuentas}")]
+            ])
+            await tg_app.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"📢 Nuevo pedido\n\nID: {pago_id}\nUsuario: {update.effective_user.username or update.effective_user.id}\nCuentas: {cuentas}\nTotal: {total:.2f} PEN",
+                reply_markup=kb_admin,
+            )
+
+            context.user_data["esperando_cantidad"] = False
+
+        except Exception:
             await update.message.reply_text("❌ Ingresa un número válido de cuentas.")
-            return
 
-        monto = cantidad * PRECIO_POR_CUENTA
-        pid = pedido_insert(user.id, user.username or "", cantidad, monto)
-        user_pending_orders[user.id] = pid
-        context.user_data["awaiting_cantidad"] = False
+async def on_admin_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-        await update.message.reply_text(
-            f"Ok ✅\nEl precio por cada cuenta es {PRECIO_POR_CUENTA} soles.\n"
-            f"El monto total a enviar es: {monto} soles.\n\n"
-            "📸 Envía ahora la captura del pago por Yape para continuar."
+    if query.data.startswith("confirm:"):
+        _, pago_id, user_id, cuentas = query.data.split(":")
+        cuentas = int(cuentas)
+
+        pagos_set_status(pago_id, "aprobado")
+        new_total = user_add_credits(user_id, cuentas)
+
+        # Notificar al cliente
+        await tg_app.bot.send_message(
+            chat_id=int(user_id),
+            text=f"✅ Tu pago fue confirmado.\nSe acreditaron {cuentas} créditos.\nSaldo actual: {new_total}."
         )
 
-    else:
-        await update.message.reply_text("Usa el botón Recargar para iniciar un pedido.")
+        # Confirmación al admin
+        await query.message.reply_text("✔ Pago confirmado y créditos acreditados.")
 
-async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id not in user_pending_orders:
-        await update.message.reply_text("❌ No tienes un pedido pendiente.")
-        return
+# -------------------- FLASK --------------------
+@app_flask.get("/health")
+def health():
+    return "ok", 200
 
-    pid = user_pending_orders[user.id]
-    file_id = update.message.photo[-1].file_id
-    file = await context.bot.get_file(file_id)
-    url = file.file_path
-
-    pedido_set_comprobante(pid, url)
-
-    # Notificar al admin
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Confirmar", callback_data=f"aprobar:{pid}:{user.id}")],
-        [InlineKeyboardButton("❌ Rechazar", callback_data=f"rechazar:{pid}:{user.id}")]
-    ])
-
-    await context.bot.send_photo(
-        chat_id=ADMIN_ID,
-        photo=file_id,
-        caption=f"📢 Nuevo pedido\nUsuario: @{user.username}\nCuentas: pendiente\nPedido ID: {pid}",
-        reply_markup=kb
-    )
-
-    await update.message.reply_text("📩 Hemos recibido tu comprobante. El admin verificará tu pago pronto.")
-
-async def on_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    data = q.data.split(":")
-    action, pid, uid = data[0], data[1], int(data[2])
-
-    if action == "aprobar":
-        # Buscar pedido para sumar créditos
-        r = supabase.table("pedidos").select("cantidad").eq("id", pid).limit(1).execute()
-        if r.data:
-            cantidad = int(r.data[0]["cantidad"])
-            new_total = user_add_credits(uid, cantidad)
-            pedido_set_estado(pid, "aprobado")
-            await context.bot.send_message(chat_id=uid, text=f"✅ Pago aprobado. Créditos añadidos: {cantidad}. Saldo total: {new_total}")
-            await q.message.edit_caption(q.message.caption + "\n\n✅ APROBADO")
-    elif action == "rechazar":
-        pedido_set_estado(pid, "rechazado")
-        await context.bot.send_message(chat_id=uid, text="❌ Tu pago fue rechazado. Verifica y vuelve a intentarlo.")
-        await q.message.edit_caption(q.message.caption + "\n\n❌ RECHAZADO")
-
-# -------------------- REGISTROS --------------------
+# -------------------- TELEGRAM HANDLERS --------------------
 tg_app.add_handler(CommandHandler("start", cmd_start))
-tg_app.add_handler(CallbackQueryHandler(on_button, pattern="^recargar$"))
-tg_app.add_handler(CallbackQueryHandler(on_admin_action, pattern="^(aprobar|rechazar):"))
-tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-tg_app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+tg_app.add_handler(CallbackQueryHandler(on_callback, pattern="^comprar$"))
+tg_app.add_handler(CallbackQueryHandler(on_admin_confirm, pattern="^confirm:"))
+tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+
+# -------------------- FACTORY --------------------
+def create_app():
+    def _start_telegram_polling():
+        try:
+            tg_app.run_polling(close_loop=False)
+        except Exception:
+            log.exception("Fallo al iniciar polling de Telegram")
+
+    threading.Thread(target=_start_telegram_polling, name="tg-polling", daemon=True).start()
+    return app_flask
 
 # -------------------- MAIN --------------------
-def create_app():
-    def _start_tg():
-        tg_app.run_polling()
-
-    threading.Thread(target=_start_tg, daemon=True).start()
-    return None  # Railway espera un server, puedes usar Flask si necesitas healthcheck
-
 if __name__ == "__main__":
-    tg_app.run_polling()
+    from waitress import serve
+    port = int(os.getenv("PORT", "8080"))
+    threading.Thread(target=lambda: tg_app.run_polling(close_loop=False), daemon=True).start()
+    log.info(f"🌐 Servidor Flask en http://0.0.0.0:{port}")
+    serve(app_flask, host="0.0.0.0", port=port)
+
+# 👇 Railway usará esto
+app = create_app()

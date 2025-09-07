@@ -1,16 +1,5 @@
-Flask==3.0.3
-gunicorn==21.2.0
-waitress==2.1.2
-qrcode==7.4.2
-Pillow==10.4.0
-mercadopago==2.2.0
-
-# Telegram (compatible con httpx 0.27+)
-python-telegram-bot==21.6
-
-# Supabase stack alineado a httpx 0.27+
-supabase==2.4.1
-gotrue==2.4.4
-
-# HTTPX con soporte de 'proxy'
-httpx>=0.27,<0.28
+python-telegram-bot==20.6
+supabase==2.4.0
+Flask==3.0.2
+qrcode
+pillow
