@@ -19,13 +19,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("recargas")
 
 # -------------------- ENV --------------------
-TG_BOT_TOKEN = os.getenv("TG_RECHARGE_BOT_TOKEN", "")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_API_KEY") or ""
-MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")   # p. ej. https://web-production-xxxx.up.railway.app
-CURRENCY = os.getenv("CURRENCY", "PEN")
-PRICE_PER_CREDIT = float(os.getenv("PRICE_PER_CREDIT", "1"))
+def _env(name: str, default: str = "") -> str:
+    # Limpia espacios, comillas y saltos de línea invisibles
+    val = os.getenv(name, default) or ""
+    val = val.strip().strip('"').strip("'").replace("\r", "").replace("\n", "")
+    return val
+
+TG_BOT_TOKEN   = _env("TG_RECHARGE_BOT_TOKEN")
+SUPABASE_URL   = _env("SUPABASE_URL")
+SUPABASE_KEY   = _env("SUPABASE_ANON_KEY") or _env("SUPABASE_API_KEY")
+MP_ACCESS_TOKEN = _env("MP_ACCESS_TOKEN")
+PUBLIC_BASE_URL = _env("PUBLIC_BASE_URL").rstrip("/")
+CURRENCY       = _env("CURRENCY", "PEN")
+PRICE_PER_CREDIT = float(_env("PRICE_PER_CREDIT", "1"))
 
 if not (TG_BOT_TOKEN and SUPABASE_URL and SUPABASE_KEY and MP_ACCESS_TOKEN and PUBLIC_BASE_URL):
     raise SystemExit(
@@ -33,9 +39,13 @@ if not (TG_BOT_TOKEN and SUPABASE_URL and SUPABASE_KEY and MP_ACCESS_TOKEN and P
         "SUPABASE_ANON_KEY/SUPABASE_API_KEY, MP_ACCESS_TOKEN, PUBLIC_BASE_URL"
     )
 
-# Evita que gotrue/httpx lean proxies heredados (que producen el error 'proxy' unexpected)
+# Evita proxies heredados (a veces rompen httpx/gotrue/telegram)
 for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
     os.environ.pop(_k, None)
+
+# Log útil (enmascarado) para confirmar que el token quedó limpio
+log.info("Token TG len=%s, termina en ...%s", len(TG_BOT_TOKEN), TG_BOT_TOKEN[-6:])
+log.info("PUBLIC_BASE_URL=%s", PUBLIC_BASE_URL)
 
 # -------------------- CLIENTES --------------------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
