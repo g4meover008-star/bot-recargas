@@ -90,11 +90,16 @@ def health():
 
 # ========= MAIN =========
 if __name__ == "__main__":
+    import threading
+    from waitress import serve
+
     port = int(os.getenv("PORT", "8080"))
 
-    async def run_all():
-        asyncio.create_task(dp.start_polling(bot))
-        from waitress import serve
-        serve(app, host="0.0.0.0", port=port)
+    # Lanzar el bot en un hilo separado
+    def run_bot():
+        asyncio.run(dp.start_polling(bot))
 
-    asyncio.run(run_all())
+    threading.Thread(target=run_bot, daemon=True).start()
+
+    # Lanzar Flask en el hilo principal
+    serve(app, host="0.0.0.0", port=port)
