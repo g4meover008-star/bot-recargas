@@ -1,16 +1,9 @@
 Flask==3.0.3
 gunicorn==21.2.0
 waitress==2.1.2
-qrcode==7.4.2
-Pillow==10.4.0
-
-# Bot de Telegram
+qrcode
+Pillow
+mercadopago
+supabase==2.3.4
 python-telegram-bot==20.7
-httpx==0.25.2        # PTB usa httpx 0.25.x
-
-# Supabase (usa gotrue y postgrest compatibles con httpx 0.25.x)
-supabase==2.3.2
-gotrue==2.4.4
-
-# Mercado Pago SDK
-mercadopago==2.2.0
+httpx>=0.26,<0.27
