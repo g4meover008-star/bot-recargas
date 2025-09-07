@@ -1,6 +1,7 @@
-flask==3.0.3
-python-telegram-bot==21.6
-supabase==2.3.4
-httpx==0.25.2
-qrcode==7.4.2
+Flask==3.0.3
+gunicorn==21.2.0
 waitress==3.0.0
+
+aiogram==3.4.1
+qrcode==7.4.2
+Pillow==10.4.0
