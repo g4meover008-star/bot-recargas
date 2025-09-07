@@ -1,36 +1,24 @@
-import os, io, uuid, logging, qrcode
+import os, uuid, logging
 from datetime import datetime
-from flask import Flask, request
-from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 from supabase import create_client, Client
-import asyncio
-from waitress import serve
 
-# ========= LOGGING =========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("recargas")
 
 # ========= ENV =========
 TG_BOT_TOKEN = os.getenv("TG_RECHARGE_BOT_TOKEN", "")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))   # tu chat ID de admin
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_API_KEY") or ""
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
-CURRENCY = os.getenv("CURRENCY", "PEN")
+SUPABASE_KEY = os.getenv("SUPABASE_API_KEY") or ""
 PRICE_PER_CREDIT = float(os.getenv("PRICE_PER_CREDIT", "1"))
-YAPE_NUMBER = os.getenv("YAPE_NUMBER", "999999999")  # Tu número Yape
 
-if not (TG_BOT_TOKEN and SUPABASE_URL and SUPABASE_KEY and PUBLIC_BASE_URL and YAPE_NUMBER):
-    raise SystemExit("Faltan variables de entorno necesarias")
-
-# ========= CLIENTES =========
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-app = Flask(__name__)
-bot = Bot(TG_BOT_TOKEN, parse_mode="HTML")
 tg_app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
 
 # ========= DB helpers =========
-def pagos_upsert(pago_id: str, user_id: str, username: str, amount: float):
+def pagos_upsert(pago_id, user_id, username, amount):
     supabase.table("pagos").upsert({
         "id": pago_id,
         "user_id": str(user_id),
@@ -40,100 +28,83 @@ def pagos_upsert(pago_id: str, user_id: str, username: str, amount: float):
         "created_at": datetime.utcnow().isoformat()
     }, on_conflict="id").execute()
 
-def pagos_set_status(pago_id: str, new_status: str):
-    data = {"status": new_status, "updated_at": datetime.utcnow().isoformat()}
-    supabase.table("pagos").update(data).eq("id", pago_id).execute()
+def pagos_set_status(pago_id, status):
+    supabase.table("pagos").update({"status": status}).eq("id", pago_id).execute()
 
-def user_add_credits(user_id: str, amount_paid: float):
+def user_add_credits(user_id: str, amount: float):
     r = supabase.table("usuarios").select("creditos").eq("telegram_id", str(user_id)).limit(1).execute()
-    current = int(r.data[0]["creditos"]) if r.data and r.data[0].get("creditos") is not None else 0
-    to_add = int(round(amount_paid / PRICE_PER_CREDIT))
+    current = int(r.data[0]["creditos"]) if r.data else 0
+    to_add = int(round(amount / PRICE_PER_CREDIT))
     new_value = current + to_add
     supabase.table("usuarios").update({"creditos": new_value}).eq("telegram_id", str(user_id)).execute()
-    supabase.table("creditos_historial").insert({
-        "usuario_id": str(user_id),
-        "delta": to_add,
-        "motivo": "recarga_yape",
-        "hecho_por": "yape"
-    }).execute()
     return to_add, new_value
 
-# ========= QR =========
-def build_yape_qr(amount: float, pago_id: str) -> bytes:
-    url = f"yape://pay?number={YAPE_NUMBER}&amount={amount}&id={pago_id}"
-    img = qrcode.make(url)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
-# ========= TELEGRAM =========
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 Bot de Recargas con Yape\n"
-        "Usa /recargar <monto>\n\n"
-        "Ejemplo:\n/recargar 5"
-    )
-
+# ========= HANDLERS =========
 async def cmd_recargar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if len(context.args) != 1:
         await update.message.reply_text("Uso: /recargar <monto>. Ej: /recargar 5")
         return
-
+    
     try:
         amount = float(context.args[0])
-        if amount <= 0:
-            raise ValueError()
-    except Exception:
-        await update.message.reply_text("Monto inválido. Ej: /recargar 5")
+    except:
+        await update.message.reply_text("Monto inválido.")
         return
 
     pago_id = str(uuid.uuid4())
-    pagos_upsert(pago_id, str(user.id), user.username or "", amount)
+    pagos_upsert(pago_id, user.id, user.username or "", amount)
 
+    await update.message.reply_photo(
+        photo=open("static/yape_qr.png", "rb"),  # tu QR guardado en carpeta
+        caption=f"📲 Paga {amount:.2f} soles escaneando este QR.\n"
+                f"ID de pago: {pago_id}\n\n"
+                "Después de pagar, envía una captura aquí 📷"
+    )
+
+# Guardar captura y reenviar a admin
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    pago_id = str(uuid.uuid4())  # podrías buscar el último pago pendiente en DB
+
+    file_id = update.message.photo[-1].file_id
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📲 Ver QR Yape", callback_data=f"qr:{pago_id}:{amount}")]
+        [InlineKeyboardButton("✅ Aprobar", callback_data=f"ok:{user.id}:{pago_id}")],
+        [InlineKeyboardButton("❌ Rechazar", callback_data=f"no:{user.id}:{pago_id}")]
     ])
-    await update.message.reply_text(
-        f"💵 Recarga solicitada: {amount:.2f} {CURRENCY}\n"
-        f"ID de pedido: <code>{pago_id}</code>\n\n"
-        "Escanea el QR y paga con Yape.\n"
-        "Cuando confirmemos el pago, tus créditos se acreditarán.",
+
+    # notificación al admin
+    await context.bot.send_photo(
+        chat_id=ADMIN_CHAT_ID,
+        photo=file_id,
+        caption=f"📥 Nuevo pago\nUsuario: @{user.username}\nMonto: (ver DB)\nPago ID: {pago_id}",
         reply_markup=kb
     )
 
-async def on_qr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # notificación al usuario
+    await update.message.reply_text("📤 Enviamos tu comprobante al admin, espera confirmación.")
+
+# Admin confirma/rechaza
+async def on_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    data = q.data.split(":")
-    if len(data) != 3:
-        return
-    pago_id, amount = data[1], float(data[2])
+    action, user_id, pago_id = q.data.split(":")
+    user_id = int(user_id)
 
-    png = build_yape_qr(amount, pago_id)
-    await q.message.reply_photo(png, caption="Escanea este QR para pagar con Yape 📲")
-
-tg_app.add_handler(CommandHandler("start", cmd_start))
-tg_app.add_handler(CommandHandler("recargar", cmd_recargar))
-tg_app.add_handler(CallbackQueryHandler(on_qr_callback, pattern=r"^qr:"))
-
-# ========= FLASK =========
-@app.route("/health", methods=["GET"])
-def health():
-    return "ok", 200
+    if action == "ok":
+        to_add, new_total = user_add_credits(user_id, 5)  # aquí deberías consultar el monto en DB
+        pagos_set_status(pago_id, "aprobado")
+        await context.bot.send_message(chat_id=user_id, text=f"✅ Recarga aprobada. Créditos añadidos: {to_add}. Total: {new_total}")
+        await q.edit_message_caption(q.message.caption + "\n\n✅ Aprobado")
+    else:
+        pagos_set_status(pago_id, "rechazado")
+        await context.bot.send_message(chat_id=user_id, text="❌ Tu recarga fue rechazada.")
+        await q.edit_message_caption(q.message.caption + "\n\n❌ Rechazado")
 
 # ========= MAIN =========
+tg_app.add_handler(CommandHandler("recargar", cmd_recargar))
+tg_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+tg_app.add_handler(CallbackQueryHandler(on_admin_action, pattern="^(ok|no):"))
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
-
-    async def run_all():
-        task_bot = asyncio.create_task(tg_app.run_polling(close_loop=False))
-
-        loop = asyncio.get_event_loop()
-        def run_flask():
-            serve(app, host="0.0.0.0", port=port)
-        task_flask = loop.run_in_executor(None, run_flask)
-
-        await asyncio.gather(task_bot, task_flask)
-
-    asyncio.run(run_all())
+    tg_app.run_polling()
