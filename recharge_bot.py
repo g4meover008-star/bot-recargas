@@ -8,7 +8,7 @@ from telegram.ext import (
     ContextTypes,
     CallbackQueryHandler,
 )
-from supabase import create_client, Client
+from supabase import create_client
 
 # ========== LOGGING ==========
 logging.basicConfig(
@@ -28,50 +28,63 @@ PRICE_PER_CREDIT = float(os.getenv("PRICE_PER_CREDIT", "1"))
 YAPE_QR_URL = os.getenv("YAPE_QR_URL", "")
 
 # ========== SUPABASE CLIENT ==========
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ========== FLASK APP ==========
+# ========== FLASK SERVER ==========
 app_flask = Flask(__name__)
 
 @app_flask.route("/health", methods=["GET"])
 def health():
     return "ok", 200
 
-# ========== HANDLERS ==========
+# ========== COMANDOS DEL BOT ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("Recargar créditos 💳", callback_data="recargar")]
-    ]
     await update.message.reply_text(
-        "Bienvenido 👋\nElige una opción:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "👋 Hola! Bienvenido al bot de recargas.\n"
+        "Usa /recargar para iniciar tu recarga."
     )
 
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def recargar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("📸 Enviar captura de pago", callback_data="enviar_pago")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        f"💳 Para recargar, paga con Yape.\n"
+        f"👉 Precio por crédito: {PRICE_PER_CREDIT}.\n\n"
+        f"📷 Escanea este QR y envía tu captura: {YAPE_QR_URL}",
+        reply_markup=reply_markup
+    )
+
+async def on_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "recargar":
-        # Aquí se muestra el QR de Yape
-        if YAPE_QR_URL:
-            await query.message.reply_photo(
-                photo=YAPE_QR_URL,
-                caption=f"Escanea el QR para pagar.\nPrecio por crédito: {PRICE_PER_CREDIT} soles.\n\nDespués de pagar, envía captura 📷"
-            )
-        else:
-            await query.message.reply_text("⚠️ No se configuró el QR de Yape.")
-
-# ========== TELEGRAM BOT ==========
-tg_app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
-tg_app.add_handler(CommandHandler("start", start))
-tg_app.add_handler(CallbackQueryHandler(on_button))
+    if query.data == "enviar_pago":
+        await query.edit_message_text(
+            "📸 Envía aquí la captura de tu pago.\n"
+            "Un administrador validará tu recarga."
+        )
 
 # ========== MAIN ==========
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
 
     async def run_all():
+        tg_app = (
+            ApplicationBuilder()
+            .token(TG_BOT_TOKEN)
+            .build()
+        )
+
+        tg_app.add_handler(CommandHandler("start", start))
+        tg_app.add_handler(CommandHandler("recargar", recargar))
+        tg_app.add_handler(CallbackQueryHandler(on_payment_callback))
+
+        # Ejecutar bot y servidor Flask
         asyncio.create_task(tg_app.run_polling(close_loop=False))
+
         from waitress import serve
         serve(app_flask, host="0.0.0.0", port=port)
 
