@@ -5,8 +5,11 @@ python-telegram-bot==20.7
 flask==3.0.3
 waitress==2.1.2
 
-# --- Supabase (usa versión estable 1.x para evitar el bug de proxy y conflictos de httpx) ---
+# --- Supabase (lock en 1.x estable) ---
 supabase==1.0.3
+
+# --- Forzar compatibilidad de httpx ---
+httpx==0.25.2
 
 # --- QR Codes ---
 qrcode==7.4.2
