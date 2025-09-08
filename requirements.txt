@@ -1,16 +1,11 @@
-# --- Telegram Bot ---
 python-telegram-bot==20.7
-
-# --- Web server ---
 flask==3.0.3
 waitress==2.1.2
-
-# --- Base de datos (Supabase 2.x compatible) ---
 supabase==2.3.4
-
-# --- QR Codes ---
+gotrue==2.5.0
+postgrest==0.15.0
+realtime==1.0.2
+storage3==0.5.3
 qrcode==7.4.2
 Pillow==10.4.0
-
-# --- Utilidades ---
 requests==2.31.0
