@@ -5,13 +5,12 @@ python-telegram-bot==20.7
 flask==3.0.3
 waitress==2.1.2
 
-# --- Base de datos (Supabase 1.x) ---
-supabase==1.0.3
+# --- Base de datos (Supabase 2.x compatible con httpx 0.25.x) ---
+supabase==2.3.4
 
 # --- QR Codes ---
 qrcode==7.4.2
 Pillow==10.4.0
 
-# --- Utilidades ---
+# --- Utilidades varias ---
 requests==2.31.0
-httpx==0.25.2
