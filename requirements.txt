@@ -6,7 +6,7 @@ flask==3.0.3
 waitress==2.1.2
 
 # --- Base de datos (Supabase) ---
-supabase==2.4.0
+supabase==2.3.4
 
 # --- QR Codes ---
 qrcode==7.4.2
@@ -14,3 +14,4 @@ Pillow==10.4.0
 
 # --- Utilidades ---
 requests==2.31.0
+httpx==0.25.2
