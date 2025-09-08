@@ -5,8 +5,8 @@ python-telegram-bot==20.7
 flask==3.0.3
 waitress==2.1.2
 
-# --- Base de datos (Supabase) ---
-supabase==1.0.3
+# --- Base de datos (Supabase 2.x) ---
+supabase==2.3.4
 
 # --- QR Codes ---
 qrcode==7.4.2
