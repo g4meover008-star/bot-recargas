@@ -1,11 +1,13 @@
 # Telegram
 python-telegram-bot==20.7
 
-# Web server para Railway
+# Web
 flask==3.0.3
 waitress==2.1.2
 
-# REST y utilidades
-requests==2.31.0
+# QR (si luego quieres generar QR dinámicos puedes usar esto)
 qrcode==7.4.2
 Pillow==10.4.0
+
+# Utilidades
+requests==2.31.0
