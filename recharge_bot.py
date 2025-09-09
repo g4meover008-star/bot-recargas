@@ -1,101 +1,171 @@
-import os
-import io
-import uuid
-import asyncio
-import logging
-import qrcode
+import os, io, uuid, asyncio, logging
 from datetime import datetime
-from flask import Flask, request, jsonify
+from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+import requests
+from flask import Flask
 
-# 🚀 Supabase estable (0.7.1)
-from supabase import create_client, Client
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, Bot as TGBot
+)
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
+)
 
+# ================= LOGGING =================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("recargas")
 
-# ========= ENV =========
-TG_BOT_TOKEN = os.getenv("TG_RECHARGE_BOT_TOKEN", "")   # token del BOT DE RECARGAS
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # 👈 usa SUPABASE_KEY directamente
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # ej: https://tu-app.up.railway.app
-CURRENCY = os.getenv("CURRENCY", "PEN")             # Moneda (PEN soles)
-PRICE_PER_CREDIT = float(os.getenv("PRICE_PER_CREDIT", "1"))  # 1 sol = 1 crédito
+# ================= ENV =================
+TG_BOT_TOKEN     = os.getenv("TG_RECHARGE_BOT_TOKEN", "")
+ADMIN_CHAT_ID    = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")       # chat id del admin
+ADMIN_BOT_TOKEN  = os.getenv("ADMIN_BOT_TOKEN", "")                  # opcional; si no, se usa el mismo bot
+BRAND_NAME       = os.getenv("BRAND_NAME", "Tu Marca")
+YAPE_QR_URL      = os.getenv("YAPE_QR_URL", "")
+PRICE_PER_CREDIT = float(os.getenv("PRICE_PER_CREDIT", "1"))
 
-if not (TG_BOT_TOKEN and SUPABASE_URL and SUPABASE_KEY and PUBLIC_BASE_URL):
-    raise SystemExit("❌ Faltan variables de entorno: TG_RECHARGE_BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY, PUBLIC_BASE_URL")
+SUPABASE_URL     = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY     = os.getenv("SUPABASE_API_KEY") or os.getenv("SUPABASE_ANON_KEY") or ""
 
-# ========= CLIENTES =========
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-app_flask = Flask(__name__)
+if not (TG_BOT_TOKEN and ADMIN_CHAT_ID and SUPABASE_URL and SUPABASE_KEY):
+    raise SystemExit(
+        "Faltan variables: TG_RECHARGE_BOT_TOKEN, ADMIN_CHAT_ID, SUPABASE_URL, SUPABASE_API_KEY/ANON_KEY"
+    )
 
-# Telegram app global
-tg_app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
+# ================= SUPABASE REST HELPERS =================
+SB_REST = f"{SUPABASE_URL.rstrip('/')}/rest/v1"
+SB_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+}
+SB_TIMEOUT = 12
 
-# ========= DB helpers =========
-def pagos_upsert(pago_id: str, user_id: str, username: str, amount: float):
-    supabase.table("pagos").upsert({
-        "id": pago_id,
-        "user_id": str(user_id),
-        "username": username,
-        "amount": amount,
-        "status": "pendiente",
-        "created_at": datetime.utcnow().isoformat()
-    }).execute()
+def sb_insert(table: str, data: dict):
+    r = requests.post(
+        f"{SB_REST}/{table}",
+        headers={**SB_HEADERS, "Prefer": "return=representation"},
+        json=data, timeout=SB_TIMEOUT
+    )
+    r.raise_for_status()
+    return r.json()[0] if r.text else None
 
-def pagos_set_status(pago_id: str, new_status: str):
-    data = {"status": new_status, "updated_at": datetime.utcnow().isoformat()}
-    supabase.table("pagos").update(data).eq("id", pago_id).execute()
+def sb_patch(table: str, where: str, data: dict):
+    # where ejemplo: "id=eq.abc123"  | "telegram_id=eq.12345"
+    r = requests.patch(
+        f"{SB_REST}/{table}?{where}",
+        headers={**SB_HEADERS, "Prefer": "return=representation"},
+        json=data, timeout=SB_TIMEOUT
+    )
+    r.raise_for_status()
+    return r.json()[0] if r.text else None
 
-def pagos_get(pago_id: str):
-    r = supabase.table("pagos").select("*").eq("id", pago_id).limit(1).execute()
-    return r.data[0] if r.data else None
+def sb_select_one(table: str, where: str, select="*", order: Optional[str] = None):
+    url = f"{SB_REST}/{table}?{where}"
+    params = {"select": select}
+    if order:
+        url += f"&order={order}"
+    r = requests.get(url, headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
+    r.raise_for_status()
+    arr = r.json()
+    return arr[0] if arr else None
 
-def user_add_credits(user_id: str, amount_paid: float):
-    """ Por defecto 1 sol = 1 crédito (PRICE_PER_CREDIT). """
-    r = supabase.table("usuarios").select("creditos").eq("telegram_id", str(user_id)).limit(1).execute()
-    current = int(r.data[0]["creditos"]) if r.data and r.data[0].get("creditos") is not None else 0
-    to_add = int(round(amount_paid / PRICE_PER_CREDIT))
-    new_value = current + to_add
-    supabase.table("usuarios").update({"creditos": new_value}).eq("telegram_id", str(user_id)).execute()
-    # Historial (opcional)
+# Usuario
+def ensure_user(user_id: int, username: str):
+    u = sb_select_one("usuarios", f"telegram_id=eq.{user_id}", select="telegram_id,username,creditos")
+    if not u:
+        return sb_insert("usuarios", {
+            "telegram_id": str(user_id),
+            "username": username or "",
+            "creditos": 0
+        })
+    return u
+
+def get_user_credits(user_id: int) -> int:
+    u = sb_select_one("usuarios", f"telegram_id=eq.{user_id}", select="creditos")
+    return int(u["creditos"]) if u and u.get("creditos") is not None else 0
+
+def add_credits(user_id: int, delta: int, motivo="recarga_yape") -> int:
+    u = ensure_user(user_id, "")
+    current = int(u.get("creditos", 0))
+    new_val = current + int(delta)
+    sb_patch("usuarios", f"telegram_id=eq.{user_id}", {"creditos": new_val, "updated_at": datetime.utcnow().isoformat()})
     try:
-        supabase.table("creditos_historial").insert({
+        sb_insert("creditos_historial", {
             "usuario_id": str(user_id),
-            "delta": to_add,
-            "motivo": "recarga_manual",
-            "hecho_por": "yape_qr"
-        }).execute()
+            "delta": int(delta),
+            "motivo": motivo,
+            "hecho_por": "admin"
+        })
     except Exception:
         pass
-    return to_add, new_value
+    return new_val
 
-# ========= QR del link =========
-def build_qr_png_bytes(path: str) -> bytes:
-    img = qrcode.make(path)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+# Pagos
+def create_pago(pago_id: str, user_id: int, username: str, amount: float):
+    return sb_insert("pagos", {
+        "id": pago_id,
+        "user_id": str(user_id),
+        "username": username or "",
+        "amount": float(amount),
+        "status": "pendiente",
+        "created_at": datetime.utcnow().isoformat()
+    })
 
-# ========= TELEGRAM HANDLERS =========
+def get_pago(pago_id: str):
+    return sb_select_one("pagos", f"id=eq.{pago_id}")
+
+def last_pending_for_user(user_id: int):
+    return sb_select_one(
+        "pagos",
+        f"user_id=eq.{user_id}&status=eq.pendiente",
+        order="created_at.desc",
+        select="*"
+    )
+
+def set_pago_status(pago_id: str, new_status: str, extra: Optional[dict] = None):
+    data = {"status": new_status, "updated_at": datetime.utcnow().isoformat()}
+    if extra:
+        data.update(extra)
+    return sb_patch("pagos", f"id=eq.{pago_id}", data)
+
+# ================= TELEGRAM =================
+app_flask = Flask(__name__)
+tg_app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
+
+def calc_credits(amount: float) -> int:
+    # 1 sol = 1 crédito por defecto (configurable por PRICE_PER_CREDIT)
+    return int(round(float(amount) / max(PRICE_PER_CREDIT, 0.0001)))
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 Bot de Recargas\n"
-        "Usa /recargar <monto>\n\n"
-        "Ejemplos:\n"
-        "/recargar 5  (5 soles)\n"
-        "/recargar 10 (10 soles)\n\n"
-        "Recibirás el QR para pagar. Luego envía la captura del pago y un admin lo confirmará."
+        f"👋 Bienvenido a <b>{BRAND_NAME}</b>.\n"
+        "Este bot te permite <b>recargar créditos con Yape</b>.\n\n"
+        "Comandos:\n"
+        "• /recargar <monto> — Ej: /recargar 5\n"
+        "• /saldo — ver tus créditos\n"
+        "• /cancel — cancelar solicitud pendiente",
+        parse_mode="HTML"
     )
+
+async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    credits = get_user_credits(update.effective_user.id)
+    await update.message.reply_text(f"💳 Tus créditos: <b>{credits}</b>", parse_mode="HTML")
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    row = last_pending_for_user(update.effective_user.id)
+    if not row:
+        await update.message.reply_text("No tienes solicitudes pendientes.")
+        return
+    set_pago_status(row["id"], "cancelado")
+    await update.message.reply_text("✔️ Solicitud cancelada.")
 
 async def cmd_recargar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if len(context.args) != 1:
-        await update.message.reply_text("Uso: /recargar <monto_en_soles>\nEj: /recargar 5")
+        await update.message.reply_text("Uso: /recargar <monto>\nEj: /recargar 5")
         return
-
     try:
         amount = float(context.args[0])
         if amount <= 0:
@@ -104,61 +174,179 @@ async def cmd_recargar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Monto inválido. Ej: /recargar 5")
         return
 
-    pago_id = str(uuid.uuid4())
-    pagos_upsert(pago_id, str(user.id), user.username or "", amount)
+    # crea registro
+    pago_id = uuid.uuid4().hex[:12]
+    try:
+        create_pago(pago_id, user.id, user.username or "", amount)
+    except Exception as e:
+        log.exception("No pude crear pago")
+        await update.message.reply_text("Error creando la solicitud. Intenta de nuevo.")
+        return
 
-    # Generar QR (usamos una imagen fija que subiste a Railway o link)
-    qr_path = os.getenv("YAPE_QR_URL", "https://i.imgur.com/xxxxx.png")
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Cancelar solicitud", callback_data=f"cancel:{pago_id}")]]
+    )
+    caption = (
+        f"🧾 Pedido <code>{pago_id}</code>\n"
+        f"Importe: <b>{amount:.2f} PEN</b>\n"
+        f"Créditos que recibirás: <b>{calc_credits(amount)}</b>\n\n"
+        "1) Escanea o abre el QR de Yape (abajo).\n"
+        "2) Paga el monto exacto.\n"
+        "3) Envíame <b>la captura</b> del pago en este chat."
+    )
+    if YAPE_QR_URL:
+        await update.message.reply_photo(
+            YAPE_QR_URL, caption=caption, parse_mode="HTML", reply_markup=kb
+        )
+    else:
+        await update.message.reply_text(caption, parse_mode="HTML", reply_markup=kb)
+
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    row = last_pending_for_user(user.id)
+    if not row:
+        await update.message.reply_text("No encuentro una solicitud pendiente. Usa /recargar primero.")
+        return
+
+    # guardar file_id
+    photo = update.message.photo[-1]
+    file_id = photo.file_id
+    try:
+        set_pago_status(row["id"], "en_revision", {"capture_file_id": file_id})
+    except Exception:
+        pass
+
+    # descargar y reenviar al admin (si hay ADMIN_BOT_TOKEN se usa ese bot; si no, el mismo)
+    tmp = f"/tmp/{uuid.uuid4().hex}.jpg"
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        await tg_file.download_to_drive(tmp)
+    except Exception as e:
+        log.warning("No pude descargar la foto: %s", e)
+        tmp = None
+
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📸 Ya pagué (enviar captura)", callback_data=f"confirma:{pago_id}")]
+        [
+            InlineKeyboardButton("✅ Aprobar", callback_data=f"adm:ok:{row['id']}"),
+            InlineKeyboardButton("❌ Rechazar", callback_data=f"adm:ko:{row['id']}"),
+        ]
     ])
-
-    await update.message.reply_photo(
-        qr_path,
-        caption=(
-            f"🧾 Solicitud de recarga\n"
-            f"Monto: {amount:.2f} {CURRENCY}\n"
-            f"ID de pedido: <code>{pago_id}</code>\n\n"
-            "Paga usando este QR y luego envía la captura.\n"
-            "Un admin confirmará tu pago."
-        ),
-        reply_markup=kb
+    caption = (
+        f"🧾 <b>Solicitud de recarga</b>\n"
+        f"ID: <code>{row['id']}</code>\n"
+        f"Usuario: @{user.username or 'sin_usuario'} (ID {user.id})\n"
+        f"Monto: <b>{row['amount']:.2f} PEN</b>\n"
+        f"Créditos: <b>{calc_credits(row['amount'])}</b>"
     )
 
-async def on_confirma_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if ADMIN_BOT_TOKEN:
+            async with TGBot(ADMIN_BOT_TOKEN) as abot:
+                if tmp and os.path.exists(tmp):
+                    with open(tmp, "rb") as f:
+                        await abot.send_photo(ADMIN_CHAT_ID, f, caption=caption, parse_mode="HTML", reply_markup=kb)
+                else:
+                    await abot.send_message(ADMIN_CHAT_ID, caption + "\n\n(No se pudo reenviar la imagen)", parse_mode="HTML", reply_markup=kb)
+        else:
+            if tmp and os.path.exists(tmp):
+                with open(tmp, "rb") as f:
+                    await context.bot.send_photo(ADMIN_CHAT_ID, f, caption=caption, parse_mode="HTML", reply_markup=kb)
+            else:
+                await context.bot.send_message(ADMIN_CHAT_ID, caption + "\n\n(No se pudo reenviar la imagen)", parse_mode="HTML", reply_markup=kb)
+    finally:
+        try:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+    await update.message.reply_text("📸 Captura recibida. En breve el administrador la revisará.")
+
+async def on_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    data = q.data or ""
-    if not data.startswith("confirma:"):
+    if q.from_user.id != ADMIN_CHAT_ID:
+        await q.answer("Solo el admin puede usar estos botones.", show_alert=True)
         return
-    pago_id = data.split(":", 1)[1]
-    row = pagos_get(pago_id)
+
+    data = (q.data or "").split(":")
+    if len(data) != 3 or data[0] != "adm":
+        return
+    action, pago_id = data[1], data[2]
+
+    row = get_pago(pago_id)
     if not row:
-        await q.message.reply_text("No encuentro ese pedido.")
+        await q.edit_message_caption(caption="(Registro no encontrado)")
+        return
+    if row["status"] == "aprobado":
+        await q.answer("Ya estaba aprobado.")
+        return
+    if row["status"] == "rechazado":
+        await q.answer("Ya estaba rechazado.")
         return
 
-    # Aquí notificarías a los admins (igual que tu bot de reemplazos)
-    await q.message.reply_text(
-        f"📩 Admins han sido notificados del pago {pago_id}. Espera confirmación."
-    )
+    if action == "ok":
+        credits = calc_credits(row["amount"])
+        new_total = add_credits(int(row["user_id"]), credits, motivo="recarga_yape")
+        set_pago_status(pago_id, "aprobado", {"admin_id": str(ADMIN_CHAT_ID)})
 
-tg_app.add_handler(CommandHandler("start", cmd_start))
+        # notificar al usuario
+        text_user = (
+            "✅ <b>Recarga acreditada</b>\n"
+            f"Monto: {row['amount']:.2f} PEN\n"
+            f"Créditos añadidos: <b>{credits}</b>\n"
+            f"Saldo actual: <b>{new_total}</b>"
+        )
+        try:
+            await context.bot.send_message(chat_id=int(row["user_id"]), text=text_user, parse_mode="HTML")
+        except Exception:
+            pass
+
+        await q.edit_message_caption(
+            caption=f"✔️ APROBADO\nID {pago_id} — {row['amount']:.2f} PEN — +{credits} créditos",
+            parse_mode="HTML"
+        )
+    else:
+        set_pago_status(pago_id, "rechazado", {"admin_id": str(ADMIN_CHAT_ID)})
+        try:
+            await context.bot.send_message(chat_id=int(row["user_id"]),
+                                           text="❌ Tu recarga fue rechazada. Si crees que es un error, contáctanos.")
+        except Exception:
+            pass
+        await q.edit_message_caption(caption=f"❌ RECHAZADO\nID {pago_id}", parse_mode="HTML")
+
+async def on_cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = (q.data or "").split(":")
+    if len(data) != 2 or data[0] != "cancel":
+        return
+    pago_id = data[1]
+    set_pago_status(pago_id, "cancelado")
+    await q.edit_message_caption(caption=f"🧾 Pedido {pago_id}\nEstado: CANCELADO")
+
+# ================ REGISTRO HANDLERS ================
+tg_app.add_handler(CommandHandler("start",   cmd_start))
+tg_app.add_handler(CommandHandler("saldo",   cmd_saldo))
+tg_app.add_handler(CommandHandler("cancel",  cmd_cancel))
 tg_app.add_handler(CommandHandler("recargar", cmd_recargar))
-tg_app.add_handler(CallbackQueryHandler(on_confirma_callback, pattern=r"^confirma:"))
+tg_app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+tg_app.add_handler(CallbackQueryHandler(on_admin_action, pattern=r"^adm:"))
+tg_app.add_handler(CallbackQueryHandler(on_cancel_button, pattern=r"^cancel:"))
 
-# ========= FLASK WEB =========
+# ================= FLASK =================
 @app_flask.route("/health", methods=["GET"])
 def health():
     return "ok", 200
 
-# ========= MAIN =========
+# ================= MAIN =================
 if __name__ == "__main__":
+    log.info("Recargas %s iniciando…", BRAND_NAME)
+    log.info("YAPE_QR_URL: %s", "definido" if YAPE_QR_URL else "NO definido")
     port = int(os.getenv("PORT", "8080"))
 
     async def run_all():
-        # arranca el bot de TG en segundo plano
         asyncio.create_task(tg_app.run_polling(close_loop=False))
-        # arranca Flask (servidor http) en el hilo principal
         from waitress import serve
         serve(app_flask, host="0.0.0.0", port=port)
 

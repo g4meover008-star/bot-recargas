@@ -1,17 +1,11 @@
-# --- Telegram Bot ---
+# Telegram
 python-telegram-bot==20.7
 
-# --- Web server ---
+# Web server para Railway
 flask==3.0.3
 waitress==2.1.2
 
-# --- Base de datos (Supabase) ---
-supabase-py==0.7.1
-
-# --- QR Codes ---
+# REST y utilidades
+requests==2.31.0
 qrcode==7.4.2
 Pillow==10.4.0
-
-# --- Utilidades ---
-requests==2.31.0
-httpx==0.23.3   # 👈 versión compatible
