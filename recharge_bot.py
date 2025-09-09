@@ -339,15 +339,34 @@ tg_app.add_handler(CallbackQueryHandler(on_cancel_button, pattern=r"^cancel:"))
 def health():
     return "ok", 200
 
-# ================= MAIN =================
+# ================= MAIN (CORREGIDO) =================
+import threading
+
 if __name__ == "__main__":
     log.info("Recargas %s iniciando…", BRAND_NAME)
     log.info("YAPE_QR_URL: %s", "definido" if YAPE_QR_URL else "NO definido")
     port = int(os.getenv("PORT", "8080"))
 
-    async def run_all():
-        asyncio.create_task(tg_app.run_polling(close_loop=False))
+    def run_http():
+        """Servidor HTTP (Flask + Waitress) en un hilo separado."""
         from waitress import serve
         serve(app_flask, host="0.0.0.0", port=port)
 
-    asyncio.run(run_all())
+    async def main():
+        # 1) Levanta Flask en otro hilo para no bloquear el event loop
+        threading.Thread(target=run_http, daemon=True).start()
+
+        # 2) Inicia el bot sin bloquear el event loop
+        await tg_app.initialize()
+        await tg_app.start()
+        await tg_app.updater.start_polling()
+
+        log.info("Telegram bot en polling. Todo listo.")
+
+        # 3) Mantén vivo el event loop
+        await asyncio.Event().wait()
+
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
