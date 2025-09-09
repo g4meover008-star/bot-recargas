@@ -222,17 +222,32 @@ app.add_handler(CallbackQueryHandler(on_qr, pattern=r"^qr:"))
 app.add_handler(CallbackQueryHandler(on_cancel, pattern=r"^cancel:"))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-# ============== MAIN ==============
-def run_bot():
-    log.info("Recargas %s iniciando…", BRAND_NAME)
-    log.info("YAPE_QR_URL: %s", "definido" if YAPE_QR_URL else "NO definido")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=True)
-
+# ========= MAIN =========
 if __name__ == "__main__":
-    # Bot en hilo, Flask en principal → evita el error del event loop
-    t = Thread(target=run_bot, daemon=True)
+    # Railway expone el puerto en $PORT
+    port = int(os.getenv("PORT", "8080"))
+
+    def run_bot():
+        """
+        Arranca el bot de Telegram en un hilo independiente
+        con su propio event loop de asyncio.
+        """
+        # Crear y asignar event loop para este hilo
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        # Arrancar el polling (bloqueante) usando ese loop
+        # IMPORTANTE: no usar close_loop=True aquí
+        from telegram import Update  # por si no está en el scope del hilo
+        log.info("Iniciando bot de Telegram (polling)…")
+        tg_app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # Bot en un hilo “daemon” para que el proceso principal (waitress) pueda
+    # terminar si algo va mal sin quedar colgado
+    t = threading.Thread(target=run_bot, name="run_bot", daemon=True)
     t.start()
 
-    port = int(os.getenv("PORT", "8080"))
-    log.info("HTTP escuchando en 0.0.0.0:%s", port)
+    # Arrancar el servidor HTTP (Flask) en el hilo principal
+    from waitress import serve
+    log.info(f"HTTP escuchando en 0.0.0.0:{port}")
     serve(app_flask, host="0.0.0.0", port=port)
