@@ -1,13 +1,13 @@
-# Telegram
+# --- Telegram Bot ---
 python-telegram-bot==20.7
 
-# Web
+# --- Web server ---
 flask==3.0.3
 waitress==2.1.2
 
-# QR (si luego quieres generar QR dinámicos puedes usar esto)
+# --- QR (si necesitas en el futuro) ---
 qrcode==7.4.2
 Pillow==10.4.0
 
-# Utilidades
+# --- HTTP ---
 requests==2.31.0
