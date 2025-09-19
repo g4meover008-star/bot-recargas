@@ -166,6 +166,19 @@ def kb_admin(order_id: str, user_id: int, qty: int):
         ]
     ])
 
+# ===== NEW: util para borrar un mensaje con botón =====
+async def _delete_button_message(update_or_query):
+    """Borra el mensaje que contiene el botón que se pulsó (si existe)."""
+    try:
+        if hasattr(update_or_query, "callback_query") and update_or_query.callback_query:
+            msg = update_or_query.callback_query.message
+        else:
+            msg = update_or_query.effective_message
+        if msg:
+            await msg.delete()
+    except Exception:
+        pass
+
 # ========= Handlers =========
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -180,11 +193,14 @@ async def on_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data or ""
 
+    # NEW: borra el mensaje con el botón antes de mostrar el siguiente paso
+    await _delete_button_message(update)
+
     if data == "recargar":
         context.user_data[UD_AWAIT_QTY] = True
         context.user_data.pop(UD_ORDER, None)
         context.user_data.pop(UD_AWAIT_PROOF, None)
-        await q.message.reply_text(
+        await q.message.chat.send_message(
             f"Indica cuántas <b>cuentas</b> deseas comprar.\n"
             f"Precio por cuenta: <b>{PRICE_PER_CREDIT:.2f}</b> (crédito c/u).",
             parse_mode="HTML"
@@ -195,20 +211,20 @@ async def on_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         user = sb_select_one("usuarios", {"telegram_id": str(user_id)}, "creditos")
         cred = int(user["creditos"]) if (user and user.get("creditos") is not None) else 0
-        await q.message.reply_text(f"💼 Tus créditos: <b>{cred}</b>", parse_mode="HTML")
+        await q.message.chat.send_message(f"💼 Tus créditos: <b>{cred}</b>", parse_mode="HTML")
 
     elif data == "ayuda":
-        await q.message.reply_text(
+        await q.message.chat.send_message(
             "1) Pulsa <b>Recargar</b> y escribe la cantidad de cuentas.\n"
             "2) Paga el monto exacto usando el QR de Yape.\n"
-            "3) Envía la captura del pago aquí.\n"
+            "3) Envíame la <b>captura del pago</b> en este chat.\n"
             "4) Un admin aprobará y se acreditarán tus créditos.",
             parse_mode="HTML"
         )
 
     elif data == "cancel":
         context.user_data.clear()
-        await q.message.reply_text("✅ Solicitud cancelada. Vuelve a empezar con /start.")
+        await q.message.chat.send_message("✅ Solicitud cancelada. Vuelve a empezar con /start.")
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Capta la cantidad cuando el usuario está en modo 'await_qty'."""
@@ -254,6 +270,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3) Envíame la <b>captura del pago</b> en este chat."
     )
 
+    # NEW: como aquí no hay botón, no borramos nada.
     if YAPE_QR_URL.lower().startswith(("http://", "https://")):
         await update.message.reply_photo(
             YAPE_QR_URL,
@@ -262,7 +279,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cancel()
         )
     else:
-        # por si YAPE_QR_URL fuese sólo texto
         await update.message.reply_text(caption, parse_mode="HTML", reply_markup=kb_cancel())
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -298,6 +314,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ Captura recibida. Un administrador revisará tu pago en breve."
     )
+    # opcional: context.user_data.clear()
 
 async def on_admin_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Approve/Reject desde el admin."""
@@ -310,16 +327,13 @@ async def on_admin_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = int(user_id_str)
         qty = int(qty_str)
 
-        # DB: marcar aprobado (no bloqueante si falla)
         try:
             sb_patch("pagos", {"id": order_id}, {"status": "aprobado", "updated_at": datetime.utcnow().isoformat()})
         except Exception:
             pass
 
-        # Sumar créditos (qty) al usuario
         new_total = sb_add_credits(user_id, qty)
 
-        # Notificar a usuario
         try:
             await context.bot.send_message(
                 chat_id=user_id,
