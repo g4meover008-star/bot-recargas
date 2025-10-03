@@ -44,6 +44,10 @@ PRICE_PER_CREDIT = float(os.getenv("PRICE_PER_CREDIT", "1"))
 SUPABASE_URL     = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY     = os.getenv("SUPABASE_API_KEY", "")
 YAPE_QR_URL      = os.getenv("YAPE_QR_URL", "")
+# --- Límites de compra ---
+MIN_QTY = 2           # compra mínima en cuentas
+# MAX_QTY = 100       # (opcional) tope máximo
+
 
 if not all([TG_BOT_TOKEN, ADMIN_CHAT_ID, SUPABASE_URL, SUPABASE_KEY, YAPE_QR_URL]):
     raise SystemExit(
@@ -232,13 +236,28 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return  # ignorar textos fuera del flujo
 
     txt = (update.message.text or "").strip()
+
+    # Para que el linter no se queje
+    qty = 0
     try:
         qty = int(txt)
         if qty <= 0:
             raise ValueError()
     except Exception:
-        await update.message.reply_text("❗ Ingresa un número válido de cuentas. Ej: 5")
+        await update.message.reply_text("❗ Ingresa un número válido de cuentas. Ej: 2")
         return
+
+    # --- MÍNIMO DE COMPRA ---
+    if qty < MIN_QTY:
+        await update.message.reply_text(
+            f"La compra mínima es de {MIN_QTY} cuentas. Ingresa un número mayor o igual a {MIN_QTY}."
+        )
+        return
+
+    # (opcional) máximo:
+    # if qty > MAX_QTY:
+    #     await update.message.reply_text(f"El máximo permitido es {MAX_QTY} cuentas.")
+    #     return
 
     amount = qty * PRICE_PER_CREDIT
     order_id = str(uuid.uuid4())[:8]
