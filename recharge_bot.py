@@ -66,6 +66,29 @@ SB_HEADERS = {
     "Content-Type": "application/json",
 }
 
+# === PRECIOS POR TRAMO (PEN) ===
+PRICE_TIER_1_9   = 27.00   # 1 a 9 cuentas asignadas (0 o None entran aquí)
+PRICE_TIER_10_UP = 26.00   # 10 o más cuentas asignadas
+
+def sb_get_user(telegram_id: int):
+    """Trae info del usuario desde 'usuarios' incluyendo cuentas_asignadas."""
+    return sb_select_one(
+        "usuarios",
+        {"telegram_id": str(telegram_id)},
+        "telegram_id, username, creditos, cuentas_asignadas"
+    )
+
+def get_price_for_user(telegram_id: int) -> float:
+    """
+    Precio por cuenta según 'usuarios.cuentas_asignadas':
+    - 10 o más -> 26.00
+    - 1 a 9 (y 0 / null) -> 27.00
+    """
+    u = sb_get_user(telegram_id)
+    asignadas = int((u or {}).get("cuentas_asignadas") or 0)
+    return PRICE_TIER_10_UP if asignadas >= 10 else PRICE_TIER_1_9
+
+
 def sb_select_one(table: str, filters: dict, columns: str = "*"):
     """GET /rest/v1/{table}?col=eq.value&select=*  -> dict | None"""
     params = {"select": columns}
@@ -204,14 +227,18 @@ async def on_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data[UD_AWAIT_QTY] = True
         context.user_data.pop(UD_ORDER, None)
         context.user_data.pop(UD_AWAIT_PROOF, None)
+
+        user_id = update.effective_user.id
+        unit_price = get_price_for_user(user_id)
+
         await q.message.chat.send_message(
-            f"Indica cuántas <b>cuentas</b> deseas comprar.\n"
-            f"Precio por cuenta: <b>{PRICE_PER_CREDIT:.2f}</b> (crédito c/u).",
+            "Indica cuántas <b>cuentas</b> deseas comprar.\n"
+            f"Precio por cuenta (según tus cuentas asignadas): <b>{unit_price:.2f} PEN</b>.",
             parse_mode="HTML"
         )
 
     elif data == "saldo":
-        # muestra créditos actuales
+        # muestra créditos actuales (puedes dejarlo así o usar sb_get_user)
         user_id = update.effective_user.id
         user = sb_select_one("usuarios", {"telegram_id": str(user_id)}, "creditos")
         cred = int(user["creditos"]) if (user and user.get("creditos") is not None) else 0
@@ -259,11 +286,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #     await update.message.reply_text(f"El máximo permitido es {MAX_QTY} cuentas.")
     #     return
 
-    amount = qty * PRICE_PER_CREDIT
+    user_id = update.effective_user.id
+    unit_price = get_price_for_user(user_id)
+    amount = qty * unit_price
+
     order_id = str(uuid.uuid4())[:8]
 
     # Guarda orden en memoria y en DB (no bloqueante)
-    context.user_data[UD_ORDER] = {"id": order_id, "qty": qty, "amount": amount}
+    context.user_data[UD_ORDER] = {
+    "id": order_id,
+    "qty": qty,
+    "amount": amount,
+    "unit_price": unit_price,   # <-- guardamos el precio aplicado
+}
+
     context.user_data[UD_AWAIT_PROOF] = True
     context.user_data[UD_AWAIT_QTY] = False
 
@@ -281,13 +317,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     caption = (
-        f"<b>Pedido {order_id}</b>\n"
-        f"Importe: <b>{amount:.2f} PEN</b>\n"
-        f"Créditos que recibirás: <b>{qty}</b>\n\n"
-        "1) Escanea o abre el QR de Yape (abajo).\n"
-        "2) Paga el monto exacto.\n"
-        "3) Envíame la <b>captura del pago</b> en este chat."
-    )
+    f"<b>Pedido {order_id}</b>\n"
+    f"Precio por cuenta: <b>{unit_price:.2f} PEN</b>\n"
+    f"Créditos/Cuentas: <b>{qty}</b>\n"
+    f"Importe total: <b>{amount:.2f} PEN</b>\n\n"
+    "1) Escanea o abre el QR de Yape.\n"
+    "2) Paga el monto exacto.\n"
+    "3) Envíame la <b>captura del pago</b> a este chat."
+)
+
 
     # NEW: como aquí no hay botón, no borramos nada.
     if YAPE_QR_URL.lower().startswith(("http://", "https://")):
@@ -306,6 +344,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     order = context.user_data[UD_ORDER]
+    unit_price = order.get("unit_price")
     user = update.effective_user
     photo = update.message.photo[-1]  # mejor calidad
     file_id = photo.file_id
@@ -316,12 +355,14 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Notifica al admin
     cap_admin = (
-        f"📥 <b>Pago recibido</b>\n"
-        f"Usuario: <code>{user.id}</code> @{user.username}\n"
-        f"Pedido: <code>{order_id}</code>\n"
-        f"Importe: <b>{amount:.2f} PEN</b>\n"
-        f"Créditos solicitados: <b>{qty}</b>"
-    )
+    f"📥 <b>Pago recibido</b>\n"
+    f"Usuario: <code>{user.id}</code> @{user.username}\n"
+    f"Pedido: <code>{order_id}</code>\n"
+    f"Precio unitario: <b>{unit_price:.2f} PEN</b>\n"  # <-- nueva línea
+    f"Importe: <b>{amount:.2f} PEN</b>\n"
+    f"Créditos solicitados: <b>{qty}</b>"
+)
+
     await context.bot.send_photo(
         chat_id=ADMIN_CHAT_ID,
         photo=file_id,
