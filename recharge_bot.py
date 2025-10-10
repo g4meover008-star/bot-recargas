@@ -260,7 +260,8 @@ async def on_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Capta la cantidad cuando el usuario está en modo 'await_qty'."""
     if not context.user_data.get(UD_AWAIT_QTY):
-        return  # ignorar textos fuera del flujo
+        await cmd_start(update, context)   # mostrar el mismo mensaje que /start
+        return
 
     txt = (update.message.text or "").strip()
 
@@ -341,6 +342,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Recibe la captura y la manda al admin con botones de aprobar/rechazar."""
     if not context.user_data.get(UD_AWAIT_PROOF) or not context.user_data.get(UD_ORDER):
+        await cmd_start(update, context)   # responder como /start si no está en flujo
         return
 
     order = context.user_data[UD_ORDER]
@@ -461,13 +463,21 @@ def run_bot():
         stop_signals=None
     )
 
+# Fallback: si envían stickers, audios, documentos, contactos, etc.
+async def on_anything_else(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get(UD_AWAIT_QTY) and not context.user_data.get(UD_AWAIT_PROOF):
+        await cmd_start(update, context)
+
+
 def register_handlers():
     app_tg.add_handler(CommandHandler("start", cmd_start))
     app_tg.add_handler(CallbackQueryHandler(on_buttons, pattern="^(recargar|saldo|ayuda|cancel)$"))
     app_tg.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app_tg.add_handler(CallbackQueryHandler(on_admin_actions, pattern="^(approve:|reject:)"))
-    # textos (cantidad) cuando está esperando
+    # textos (cantidad) cuando está esperando o menú si no
     app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    # NUEVO: fallback para cualquier otro tipo de mensaje
+    app_tg.add_handler(MessageHandler(~filters.COMMAND & ~filters.TEXT & ~filters.PHOTO, on_anything_else))
 
 register_handlers()
 
