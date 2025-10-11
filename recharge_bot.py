@@ -544,3 +544,4 @@ if __name__ == "__main__":
 
     # Bot en otro hilo (con su propio event loop)
     run_bot()
+
