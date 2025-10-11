@@ -331,10 +331,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❗ Ingresa un número válido de cuentas. Ej: 2")
         return
 
-    # --- MÍNIMO DE COMPRA ---
-    if qty < MIN_QTY:
+    # --- MÍNIMO DE COMPRA (dinámico) ---
+    user_id = update.effective_user.id
+    min_qty = get_min_qty_for_user(user_id)   # calcula con MIN_QTY_TIERS (ej: "0:2,15:5")
+
+    if qty < min_qty:
         await update.message.reply_text(
-            f"La compra mínima es de {MIN_QTY} cuentas. Ingresa un número mayor o igual a {MIN_QTY}."
+            f"La compra mínima es de {min_qty} cuentas. Ingresa un número mayor o igual a {min_qty}."
         )
         return
 
