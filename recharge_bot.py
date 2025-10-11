@@ -53,6 +53,26 @@ MIN_QTY = 2           # compra mínima en cuentas
 # desde 0 cuentas = 23 soles, desde 10 cuentas = 21 soles
 PRICE_TIERS_ENV = os.getenv("PRICE_TIERS", "0:23,10:21")
 
+# === TRAMOS DE MÍNIMO POR CUENTAS ASIGNADAS ===
+# Formato: "min_asignadas:minimo, min_asignadas:minimo, ..."
+# Ej.: "0:2,10:5"  -> 0–9 cuentas => mínimo 2 ; 10+ => mínimo 5
+MIN_QTY_TIERS_ENV = os.getenv("MIN_QTY_TIERS", "0:2")  # default: siempre mínimo 2
+
+def _parse_min_qty_tiers(env_value: str):
+    tiers = []
+    try:
+        for part in env_value.split(","):
+            if not part.strip():
+                continue
+            k, v = part.split(":")
+            tiers.append((int(k.strip()), int(v.strip())))
+        tiers.sort(key=lambda x: x[0])
+    except Exception:
+        tiers = [(0, 2)]
+    return tiers
+
+MIN_QTY_TIERS = _parse_min_qty_tiers(MIN_QTY_TIERS_ENV)
+
 def _parse_price_tiers(env_value: str):
     """Convierte '0:23,10:21' en lista [(0,23.0),(10,21.0)] ordenada."""
     tiers = []
@@ -112,6 +132,18 @@ def get_price_for_user(telegram_id: int) -> float:
             break
     return price
 
+def get_min_qty_for_user(telegram_id: int) -> int:
+    """Devuelve el mínimo de compra según cuentas_asignadas usando MIN_QTY_TIERS."""
+    u = sb_get_user(telegram_id)
+    asignadas = int((u or {}).get("cuentas_asignadas") or 0)
+
+    min_qty = MIN_QTY_TIERS[0][1]
+    for min_asg, q in MIN_QTY_TIERS:
+        if asignadas >= min_asg:
+            min_qty = q
+        else:
+            break
+    return max(1, min_qty)
 
 def sb_select_one(table: str, filters: dict, columns: str = "*"):
     """GET /rest/v1/{table}?col=eq.value&select=*  -> dict | None"""
