@@ -67,8 +67,8 @@ SB_HEADERS = {
 }
 
 # === PRECIOS POR TRAMO (PEN) ===
-PRICE_TIER_1_9   = 27.00   # 1 a 9 cuentas asignadas (0 o None entran aquí)
-PRICE_TIER_10_UP = 26.00   # 10 o más cuentas asignadas
+PRICE_TIER_1_9   = float(os.getenv("PRICE_TIER_1_9", "27.00"))   # 1 a 9 cuentas
+PRICE_TIER_10_UP = float(os.getenv("PRICE_TIER_10_UP", "26.00")) # 10 o más cuentas
 
 def sb_get_user(telegram_id: int):
     """Trae info del usuario desde 'usuarios' incluyendo cuentas_asignadas."""
