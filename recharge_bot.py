@@ -48,6 +48,28 @@ YAPE_QR_URL      = os.getenv("YAPE_QR_URL", "")
 MIN_QTY = 2           # compra mínima en cuentas
 # MAX_QTY = 100       # (opcional) tope máximo
 
+# === CONFIGURACIÓN DE PRECIOS DESDE ENV ===
+# Ejemplo de formato: "0:23,10:21" significa:
+# desde 0 cuentas = 23 soles, desde 10 cuentas = 21 soles
+PRICE_TIERS_ENV = os.getenv("PRICE_TIERS", "0:23,10:21")
+
+def _parse_price_tiers(env_value: str):
+    """Convierte '0:23,10:21' en lista [(0,23.0),(10,21.0)] ordenada."""
+    tiers = []
+    try:
+        for part in env_value.split(","):
+            if not part.strip():
+                continue
+            k, v = part.split(":")
+            tiers.append((int(k.strip()), float(v.strip())))
+        tiers.sort(key=lambda x: x[0])
+    except Exception:
+        # si hay error, usa valores por defecto
+        tiers = [(0, 23.0), (10, 21.0)]
+    return tiers
+
+PRICE_TIERS = _parse_price_tiers(PRICE_TIERS_ENV)
+
 
 if not all([TG_BOT_TOKEN, ADMIN_CHAT_ID, SUPABASE_URL, SUPABASE_KEY, YAPE_QR_URL]):
     raise SystemExit(
@@ -66,10 +88,6 @@ SB_HEADERS = {
     "Content-Type": "application/json",
 }
 
-# === PRECIOS POR TRAMO (PEN) ===
-PRICE_TIER_1_9   = float(os.getenv("PRICE_TIER_1_9", "27.00"))   # 1 a 9 cuentas
-PRICE_TIER_10_UP = float(os.getenv("PRICE_TIER_10_UP", "26.00")) # 10 o más cuentas
-
 def sb_get_user(telegram_id: int):
     """Trae info del usuario desde 'usuarios' incluyendo cuentas_asignadas."""
     return sb_select_one(
@@ -80,13 +98,19 @@ def sb_get_user(telegram_id: int):
 
 def get_price_for_user(telegram_id: int) -> float:
     """
-    Precio por cuenta según 'usuarios.cuentas_asignadas':
-    - 10 o más -> 26.00
-    - 1 a 9 (y 0 / null) -> 27.00
+    Determina el precio según cuántas 'cuentas_asignadas' tiene el usuario.
+    Usa los tramos definidos en PRICE_TIERS.
     """
     u = sb_get_user(telegram_id)
     asignadas = int((u or {}).get("cuentas_asignadas") or 0)
-    return PRICE_TIER_10_UP if asignadas >= 10 else PRICE_TIER_1_9
+
+    price = PRICE_TIERS[0][1]  # precio base
+    for min_asg, p in PRICE_TIERS:
+        if asignadas >= min_asg:
+            price = p
+        else:
+            break
+    return price
 
 
 def sb_select_one(table: str, filters: dict, columns: str = "*"):
